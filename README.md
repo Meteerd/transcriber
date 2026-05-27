@@ -50,7 +50,7 @@ Open <http://127.0.0.1:8765>. The server only binds to localhost.
 
 ## Setup: NVIDIA / CUDA
 
-On Linux with CUDA 12 + cuDNN 9:
+On Linux with a recent NVIDIA driver:
 
 ```bash
 python3 -m venv .venv
@@ -66,6 +66,9 @@ WHISPER_ENGINE=faster-whisper
 FASTER_WHISPER_DEVICE=cuda
 FASTER_WHISPER_COMPUTE_TYPE=float16
 ```
+
+For RTX 5090 / Blackwell, `requirements-cuda.txt` pins PyTorch `2.11.0+cu128`
+from the official PyTorch cu128 wheel index so torch recognizes `sm_120`.
 
 CLI example for a two-person investor call:
 

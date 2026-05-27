@@ -17,6 +17,7 @@ Why:
 - pyannote diarization is language-agnostic and supports known speaker-count hints.
 - On Apple Silicon, MLX gives the simplest local acceleration path.
 - On NVIDIA GPUs, faster-whisper/CTranslate2 gives a mature CUDA path and exposes word timestamps.
+- RTX 5090 / Blackwell requires a PyTorch wheel new enough for `sm_120`; this repo uses the PyTorch cu128 index for the CUDA requirements.
 
 ## Projects Reviewed
 
