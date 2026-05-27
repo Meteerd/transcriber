@@ -1,0 +1,14 @@
+# Default Apple Silicon install. For NVIDIA/CUDA, use requirements-cuda.txt.
+#
+# Pinned compatible versions: this app defaults to pyannote/speaker-diarization-3.1,
+# so pyannote.audio 3.x plus torch/torchaudio<2.6 is the conservative path.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+python-dotenv>=1.0
+mlx-whisper>=0.4.2
+pyannote.audio>=3.3,<4.0
+huggingface_hub>=0.26,<1.0
+torch>=2.4,<2.6
+torchaudio>=2.4,<2.6
+numpy>=1.26

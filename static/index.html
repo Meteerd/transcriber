@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Transcriber</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0a0c;
+    --bg-2: #111114;
+    --panel: #15161a;
+    --border: #25272d;
+    --border-strong: #383b44;
+    --text: #ececf1;
+    --muted: #8b8e98;
+    --muted-2: #5d6068;
+    --accent: #a78bfa;
+    --accent-soft: rgba(167, 139, 250, 0.12);
+    --good: #56d364;
+    --warn: #e3b341;
+    --err: #f47067;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  body {
+    background:
+      radial-gradient(900px 500px at 80% -10%, rgba(167, 139, 250, 0.06), transparent 60%),
+      radial-gradient(700px 400px at -10% 10%, rgba(86, 211, 100, 0.04), transparent 60%),
+      var(--bg);
+  }
+
+  .wrap { max-width: 760px; margin: 0 auto; padding: 56px 24px 80px; }
+
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; margin-bottom: 32px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 {
+    margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  .brand .tag {
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.1em; padding: 2px 8px; border: 1px solid var(--border);
+    border-radius: 999px;
+  }
+  .meta { color: var(--muted-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  /* Options bar */
+  .options {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    margin-bottom: 12px;
+  }
+  .opt { display: flex; align-items: center; gap: 8px; }
+  .opt label {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .opt select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 13px; font-family: inherit;
+    cursor: pointer; outline: none;
+  }
+  .opt select:hover, .opt select:focus { border-color: var(--border-strong); }
+  .opt-hint {
+    flex-basis: 100%;
+    color: var(--muted-2); font-size: 11px;
+  }
+
+  /* Drop zone */
+  .drop {
+    position: relative; display: block; cursor: pointer;
+    border-radius: 16px;
+    padding: 56px 24px;
+    text-align: center;
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
+    border: 1px solid var(--border);
+    transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+    user-select: none;
+  }
+  .drop:hover { border-color: var(--border-strong); }
+  .drop.over {
+    border-color: var(--accent); background: var(--accent-soft);
+    transform: scale(1.002);
+  }
+  .drop .icon {
+    width: 36px; height: 36px; margin: 0 auto 12px;
+    color: var(--muted);
+    display: grid; place-items: center;
+    border-radius: 999px; background: var(--bg-2); border: 1px solid var(--border);
+  }
+  .drop.over .icon { color: var(--accent); border-color: var(--accent); }
+  .drop h2 { margin: 0 0 4px; font-weight: 500; font-size: 15px; color: var(--text); }
+  .drop p { margin: 0; color: var(--muted); font-size: 12px; }
+  .drop input { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; }
+
+  /* Jobs */
+  .jobs {
+    margin-top: 24px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .job {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .job-top {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .job-name {
+    font-weight: 500; font-size: 14px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0;
+  }
+  .badge {
+    flex-shrink: 0;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+    padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+    font-weight: 500;
+  }
+  .job.queued .badge { color: var(--muted); }
+  .job.running .badge { color: var(--accent); border-color: rgba(167, 139, 250, 0.4); background: var(--accent-soft); }
+  .job.done .badge { color: var(--good); border-color: rgba(86, 211, 100, 0.3); background: rgba(86, 211, 100, 0.08); }
+  .job.error .badge { color: var(--err); border-color: rgba(244, 112, 103, 0.3); background: rgba(244, 112, 103, 0.08); }
+
+  .stage { color: var(--muted); font-size: 12px; margin-top: 6px; min-height: 16px; }
+  .bar {
+    height: 3px; background: var(--bg-2); border-radius: 2px;
+    overflow: hidden; margin-top: 10px;
+  }
+  .bar > div {
+    height: 100%; width: 0;
+    background: linear-gradient(90deg, var(--accent), #d4b5ff);
+    transition: width 0.5s ease;
+  }
+  .job.done .bar > div { background: var(--good); }
+  .job.error .bar > div { background: var(--err); }
+
+  .summary {
+    color: var(--muted); font-size: 12px; margin-top: 10px;
+    display: flex; gap: 14px; flex-wrap: wrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .summary span::before { content: ""; }
+
+  .actions {
+    display: none; gap: 8px; margin-top: 12px; flex-wrap: wrap;
+  }
+  .job.done .actions { display: flex; }
+  button, .btn {
+    background: var(--bg-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+    font-family: inherit; transition: border-color 0.15s ease, background 0.15s ease;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  button:hover, .btn:hover { border-color: var(--border-strong); background: var(--panel); }
+  button.primary {
+    background: var(--accent); border-color: var(--accent); color: #1a1130;
+    font-weight: 500;
+  }
+  button.primary:hover { background: #b89dff; border-color: #b89dff; }
+
+  .transcript {
+    display: none;
+    margin-top: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    max-height: 420px;
+    overflow: auto;
+    font: 12.5px/1.65 ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #d4d7df;
+  }
+  .transcript.open { display: block; }
+
+  /* Rename panel */
+  .rename {
+    display: none;
+    margin-top: 12px;
+    padding: 14px 16px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .rename.open { display: block; }
+  .rename-title {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 10px;
+  }
+  .rename-rows {
+    display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px;
+    align-items: center; margin-bottom: 12px;
+  }
+  .rename-rows label {
+    font: 12px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--muted); padding: 6px 0;
+  }
+  .rename-rows input {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font: 13px inherit; font-family: inherit;
+    outline: none; width: 100%;
+  }
+  .rename-rows input:focus { border-color: var(--accent); }
+  .rename-actions { display: flex; gap: 8px; }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 28px; left: 50%; transform: translate(-50%, 10px);
+    background: var(--panel); border: 1px solid var(--border-strong); color: var(--text);
+    padding: 8px 14px; border-radius: 999px; font-size: 12px;
+    opacity: 0; transition: opacity 0.2s ease, transform 0.2s ease;
+    pointer-events: none; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  /* Footer */
+  footer {
+    margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+    color: var(--muted-2); font-size: 11px;
+  }
+  footer a { color: var(--muted); text-decoration: none; }
+  footer a:hover { color: var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <h1>Transcriber</h1>
+      <span class="tag">local</span>
+    </div>
+    <span class="meta">whisper · pyannote · MLX</span>
+  </header>
+
+	  <div class="options">
+	    <div class="opt">
+	      <label for="engine">Engine</label>
+	      <select id="engine">
+	        <option value="mlx">MLX (Apple Silicon)</option>
+	        <option value="faster-whisper">CUDA / CPU</option>
+	      </select>
+	    </div>
+	    <div class="opt">
+	      <label for="language">Language</label>
+	      <select id="language">
+        <option value="auto">Auto-detect</option>
+        <option value="en">English</option>
+        <option value="tr">Turkish</option>
+        <option value="hu">Hungarian</option>
+        <option value="de">German</option>
+        <option value="fr">French</option>
+        <option value="es">Spanish</option>
+        <option value="it">Italian</option>
+        <option value="ar">Arabic</option>
+        <option value="ru">Russian</option>
+        <option value="zh">Chinese</option>
+        <option value="ja">Japanese</option>
+      </select>
+    </div>
+	    <div class="opt">
+	      <label for="quality">Quality</label>
+	      <select id="quality">
+	        <option value="turbo">Turbo (fast)</option>
+	        <option value="full">Full v3 (best for TR / HU)</option>
+	      </select>
+	    </div>
+	    <div class="opt">
+	      <label for="speakers">Speakers</label>
+	      <select id="speakers">
+	        <option value="auto">Auto</option>
+	        <option value="1">1</option>
+	        <option value="2">2</option>
+	        <option value="3">3</option>
+	        <option value="4">4</option>
+	        <option value="5">5</option>
+	        <option value="6">6</option>
+	      </select>
+	    </div>
+	    <div class="opt-hint">Hint: for important calls, set language + Full v3 + known speaker count.</div>
+	  </div>
+
+  <label class="drop" for="file" id="drop">
+    <div class="icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+    </div>
+    <h2>Drop audio or video</h2>
+    <p>or click to choose · m4a · mp3 · mp4 · wav · aac · ogg · flac · webm</p>
+    <input type="file" id="file" accept="audio/*,video/*,.m4a,.mp3,.mp4,.wav,.aac,.ogg,.flac,.webm" multiple />
+  </label>
+
+  <section class="jobs" id="jobs"></section>
+
+  <footer>
+    <span>Files saved to <code style="color:var(--muted)">./transcripts/</code></span>
+    <a href="#" id="open-folder">Show in Finder</a>
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+const jobsEl = document.getElementById("jobs");
+const toast = document.getElementById("toast");
+
+const jobsView = new Map();   // job_id -> DOM node
+const jobsState = new Map();  // job_id -> latest server state
+let lastNames = {};           // remembered SPEAKER_NN -> name from previous renames
+
+fetch("/last-names").then(r => r.json()).then(d => lastNames = d || {}).catch(() => {});
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add("show");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove("show"), 1800);
+}
+
+function fmtDur(sec) {
+  if (!sec) return "—";
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}h ${m}m` : (m ? `${m}m ${s}s` : `${s}s`);
+}
+
+function render(state) {
+  let node = jobsView.get(state.id);
+  if (!node) {
+    node = document.createElement("article");
+    node.className = "job";
+    node.innerHTML = `
+      <div class="job-top">
+        <span class="job-name"></span>
+        <span class="badge"></span>
+      </div>
+      <div class="stage"></div>
+      <div class="bar"><div></div></div>
+      <div class="summary"></div>
+      <div class="actions">
+        <button class="primary copy">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy markdown
+        </button>
+        <button class="toggle">Show transcript</button>
+        <button class="rename-toggle">Rename speakers</button>
+        <a class="btn download" target="_blank" rel="noopener">Download .md</a>
+      </div>
+      <div class="rename">
+        <div class="rename-title">Rename speakers</div>
+        <div class="rename-rows"></div>
+        <div class="rename-actions">
+          <button class="primary apply">Apply</button>
+          <button class="cancel">Cancel</button>
+        </div>
+      </div>
+      <pre class="transcript"></pre>
+    `;
+    jobsEl.prepend(node);
+    jobsView.set(state.id, node);
+  }
+  jobsState.set(state.id, state);
+
+  node.className = "job " + (state.status || "queued");
+  node.querySelector(".job-name").textContent = state.original_name;
+  node.querySelector(".badge").textContent = state.status;
+  node.querySelector(".stage").textContent = state.stage || "";
+  const pct = state.status === "done" ? 100 : Math.round((state.progress || 0) * 100);
+  node.querySelector(".bar > div").style.width = pct + "%";
+
+  const summary = node.querySelector(".summary");
+  if (state.status === "done") {
+    summary.innerHTML = "";
+    const parts = [
+      `${state.num_speakers} speaker${state.num_speakers === 1 ? "" : "s"}`,
+      `${state.num_blocks} segment${state.num_blocks === 1 ? "" : "s"}`,
+	      fmtDur(state.duration_seconds),
+	      (state.language || "auto"),
+	      (state.engine || "mlx"),
+	      (state.model_quality === "full" ? "full-v3" : "turbo"),
+	    ];
+    parts.forEach(p => {
+      const s = document.createElement("span");
+      s.textContent = p;
+      summary.appendChild(s);
+    });
+    node.querySelector(".download").href = `/transcripts/${encodeURIComponent(state.transcript_name)}`;
+    node.querySelector(".copy").onclick = () => {
+      navigator.clipboard.writeText(state.markdown).then(() => showToast("Copied to clipboard"));
+    };
+    const ta = node.querySelector(".transcript");
+    const toggleBtn = node.querySelector(".toggle");
+    toggleBtn.onclick = () => {
+      const open = ta.classList.toggle("open");
+      toggleBtn.textContent = open ? "Hide transcript" : "Show transcript";
+      ta.textContent = state.markdown;  // always fresh — markdown updates after rename
+    };
+
+    // Rename UI
+    const renameBox = node.querySelector(".rename");
+    const renameToggle = node.querySelector(".rename-toggle");
+    const renameRows = node.querySelector(".rename-rows");
+    const applyBtn = node.querySelector(".apply");
+    const cancelBtn = node.querySelector(".cancel");
+
+    const speakers = state.speakers || [];
+    const buildRows = () => {
+      renameRows.innerHTML = "";
+      for (const sp of speakers) {
+        const label = document.createElement("label");
+        label.textContent = sp;
+        const input = document.createElement("input");
+        input.type = "text";
+        input.dataset.speaker = sp;
+        input.placeholder = "Leave blank to keep";
+        input.value = lastNames[sp] || "";
+        input.addEventListener("keydown", e => {
+          if (e.key === "Enter") applyBtn.click();
+          if (e.key === "Escape") cancelBtn.click();
+        });
+        renameRows.appendChild(label);
+        renameRows.appendChild(input);
+      }
+    };
+
+    renameToggle.onclick = () => {
+      const open = renameBox.classList.toggle("open");
+      renameToggle.textContent = open ? "Hide rename" : "Rename speakers";
+      if (open) {
+        buildRows();
+        // Focus first empty input
+        const inputs = renameRows.querySelectorAll("input");
+        for (const inp of inputs) {
+          if (!inp.value) { inp.focus(); break; }
+        }
+        if (!Array.from(inputs).some(i => !i.value)) inputs[0]?.focus();
+      }
+    };
+
+    cancelBtn.onclick = () => {
+      renameBox.classList.remove("open");
+      renameToggle.textContent = "Rename speakers";
+    };
+
+    applyBtn.onclick = async () => {
+      const mapping = {};
+      renameRows.querySelectorAll("input").forEach(inp => {
+        const v = inp.value.trim();
+        if (v) mapping[inp.dataset.speaker] = v;
+      });
+      if (!Object.keys(mapping).length) { cancelBtn.click(); return; }
+      applyBtn.disabled = true; applyBtn.textContent = "Applying…";
+      try {
+        const r = await fetch(`/jobs/${state.id}/rename`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(mapping),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        // Update local state and re-render
+        state.markdown = data.markdown;
+        Object.assign(lastNames, mapping);
+        if (ta.classList.contains("open")) ta.textContent = data.markdown;
+        renameBox.classList.remove("open");
+        renameToggle.textContent = "Rename speakers";
+        showToast("Renamed");
+      } catch (e) {
+        showToast("Rename failed: " + e.message);
+      } finally {
+        applyBtn.disabled = false; applyBtn.textContent = "Apply";
+      }
+    };
+  } else if (state.status === "error") {
+    summary.textContent = "Error: " + (state.error || "unknown");
+  } else {
+    summary.textContent = "";
+  }
+}
+
+async function poll(jobId) {
+  try {
+    const r = await fetch(`/jobs/${jobId}`);
+    if (!r.ok) throw new Error("status " + r.status);
+    const state = await r.json();
+    render(state);
+    if (state.status === "done" || state.status === "error") return;
+  } catch (e) {
+    console.error(e);
+  }
+  setTimeout(() => poll(jobId), 1500);
+}
+
+async function upload(file) {
+  const tmpId = "tmp-" + Math.random().toString(36).slice(2);
+  render({
+    id: tmpId,
+    original_name: file.name,
+    status: "queued",
+    stage: "Uploading…",
+    progress: 0.02,
+  });
+  const tmpNode = jobsView.get(tmpId);
+  jobsView.delete(tmpId);
+
+  const fd = new FormData();
+	  fd.append("file", file);
+	  fd.append("engine", document.getElementById("engine").value);
+	  fd.append("language", document.getElementById("language").value);
+	  fd.append("quality", document.getElementById("quality").value);
+	  fd.append("speakers", document.getElementById("speakers").value);
+  try {
+    const r = await fetch("/transcribe", { method: "POST", body: fd });
+    if (!r.ok) throw new Error("upload failed: HTTP " + r.status);
+    const { job_id } = await r.json();
+    jobsView.set(job_id, tmpNode);
+    poll(job_id);
+  } catch (e) {
+    tmpNode.classList.add("error");
+    tmpNode.querySelector(".badge").textContent = "error";
+    tmpNode.querySelector(".stage").textContent = "";
+    tmpNode.querySelector(".summary").textContent = e.message;
+  }
+}
+
+function handleFiles(files) {
+  for (const f of files) upload(f);
+}
+
+// File input handlers — label[for=file] handles the click, no JS needed.
+fileInput.addEventListener("change", () => {
+  handleFiles(fileInput.files);
+  fileInput.value = "";
+});
+
+// Drag-and-drop
+["dragenter", "dragover"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); })
+);
+["dragleave", "drop"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); })
+);
+drop.addEventListener("drop", e => {
+  if (e.dataTransfer?.files?.length) handleFiles(e.dataTransfer.files);
+});
+// Block whole-window drops from navigating away
+["dragover", "drop"].forEach(ev => window.addEventListener(ev, e => e.preventDefault()));
+
+document.getElementById("open-folder").addEventListener("click", (e) => {
+  e.preventDefault();
+  fetch("/open-folder", { method: "POST" }).catch(() => {});
+});
+</script>
+</body>
+</html>

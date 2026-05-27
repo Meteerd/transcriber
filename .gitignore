@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+uploads/
+transcripts/
+.DS_Store
+.claude/
+.ruff_cache/
+.pytest_cache/

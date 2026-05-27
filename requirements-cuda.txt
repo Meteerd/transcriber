@@ -1,0 +1,14 @@
+# NVIDIA/CUDA install for faster-whisper on Linux.
+#
+# Install CUDA 12 + cuDNN 9 first. On RTX 50-series / Blackwell, use a recent
+# NVIDIA driver and current PyTorch/CTranslate2 wheels.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+python-dotenv>=1.0
+faster-whisper>=1.2.0
+pyannote.audio>=3.3,<4.0
+huggingface_hub>=0.26,<1.0
+torch>=2.4,<2.6
+torchaudio>=2.4,<2.6
+numpy>=1.26
