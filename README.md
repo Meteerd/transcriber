@@ -80,6 +80,12 @@ FASTER_WHISPER_COMPUTE_TYPE=float16
 For RTX 5090 / Blackwell, `requirements-cuda.txt` pins PyTorch `2.11.0+cu128`
 from the official PyTorch cu128 wheel index so torch recognizes `sm_120`.
 
+For RTX 4090 / Ada, use the pyannote-compatible CUDA stack:
+
+```bash
+pip install -r requirements-cuda-rtx40.txt
+```
+
 CLI example for a two-person investor call:
 
 ```bash
@@ -152,7 +158,8 @@ This is not a Fireflies/Otter/Vexa-style meeting bot that joins Zoom, Google Mee
 - `static/index.html` - local drag-and-drop UI.
 - `cli.py` / `cli.sh` - one-shot transcription without the web server.
 - `requirements.txt` - Apple Silicon default.
-- `requirements-cuda.txt` - NVIDIA/CUDA default.
+- `requirements-cuda.txt` - NVIDIA/CUDA default for RTX 50-series.
+- `requirements-cuda-rtx40.txt` - NVIDIA/CUDA default for RTX 40-series.
 
 ## Public Repo Hygiene
 
