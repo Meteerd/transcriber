@@ -122,6 +122,12 @@ def _get_diarizer():
                 f"{DIARIZATION_MODEL} from HuggingFace."
             )
         import torch
+        import torchaudio
+
+        # pyannote.audio 3.x still references this as an eager type annotation,
+        # while newer torchaudio CUDA builds no longer export it at top-level.
+        if not hasattr(torchaudio, "AudioMetaData"):
+            torchaudio.AudioMetaData = object
         from pyannote.audio import Pipeline
 
         pipeline = Pipeline.from_pretrained(
