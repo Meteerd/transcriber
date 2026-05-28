@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections import Counter, defaultdict
@@ -150,6 +151,21 @@ def _resolve_torch_device(torch_module, requested: str) -> str:
 # --------------------------------------------------------------------------- #
 # Audio prep
 # --------------------------------------------------------------------------- #
+def _ffmpeg_binary() -> str:
+    configured = os.environ.get("FFMPEG_BINARY")
+    if configured:
+        return configured
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
 def to_wav_16k_mono(src: Path, dst: Path) -> Path:
     """Decode to 16 kHz mono PCM WAV with phone-recording-friendly cleanup:
 
@@ -162,7 +178,7 @@ def to_wav_16k_mono(src: Path, dst: Path) -> Path:
     """
     af = "highpass=f=80,dynaudnorm=f=200:g=15,loudnorm=I=-16:TP=-1.5:LRA=11"
     cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        _ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src),
         "-ac", "1", "-ar", "16000",
         "-af", af,
