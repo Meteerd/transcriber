@@ -55,6 +55,9 @@ host explicitly:
 TRANSCRIBER_HOST=100.x.y.z ./run.sh
 ```
 
+For remote use, also set `TRANSCRIBER_ACCESS_TOKEN` in `.env`. The browser will
+ask for HTTP Basic Auth with username `transcriber` and that token as password.
+
 ## Setup: NVIDIA / CUDA
 
 On Linux with a recent NVIDIA driver:
@@ -96,6 +99,9 @@ Tailscale/LAN UI:
 ```bash
 TRANSCRIBER_HOST=100.x.y.z ./run.sh
 ```
+
+Set `TRANSCRIBER_ACCESS_TOKEN` first when binding to anything other than
+`127.0.0.1`.
 
 CLI:
 

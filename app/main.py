@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import threading
 import uuid
@@ -15,7 +16,7 @@ from typing import Any
 from dotenv import load_dotenv
 load_dotenv()  # Must come BEFORE importing transcribe (env vars read at import time)
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,6 +43,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("transcriber")
 
 app = FastAPI(title="Local Transcriber")
+
+
+@app.middleware("http")
+async def require_access_token(request: Request, call_next):
+    token = os.environ.get("TRANSCRIBER_ACCESS_TOKEN")
+    if not token:
+        return await call_next(request)
+
+    header = request.headers.get("authorization", "")
+    scheme, _, encoded = header.partition(" ")
+    username = password = ""
+    if scheme.lower() == "basic" and encoded:
+        try:
+            import base64
+
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            username, _, password = decoded.partition(":")
+        except Exception:
+            username = password = ""
+
+    if secrets.compare_digest(username, "transcriber") and secrets.compare_digest(password, token):
+        return await call_next(request)
+
+    return JSONResponse(
+        {"detail": "Authentication required"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Transcriber"'},
+    )
 
 # Job registry — in-memory only. Restart = jobs lost (transcripts persist on disk).
 _jobs: dict[str, dict[str, Any]] = {}
