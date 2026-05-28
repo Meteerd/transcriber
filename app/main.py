@@ -20,11 +20,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.transcribe import (
-    transcribe_file,
     FASTER_WHISPER_MODEL_FULL,
     FASTER_WHISPER_MODEL_TURBO,
+    MIXED_LANGUAGE_PROMPTS,
     WHISPER_MODEL_TURBO,
     WHISPER_MODEL_FULL,
+    transcribe_file,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +75,7 @@ def _run_job(
     *,
     engine: str | None = None,
     language: str | None = None,
+    initial_prompt: str | None = None,
     model: str | None = None,
     num_speakers: int | None = None,
 ) -> None:
@@ -97,9 +99,11 @@ def _run_job(
         out_path, result = transcribe_file(
             upload_path,
             output_dir=TRANSCRIPTS,
+            source_name=Path(original_name).stem,
             progress=progress,
             engine=engine,
             language=language,
+            initial_prompt=initial_prompt,
             model=model,
             num_speakers=num_speakers,
         )
@@ -146,7 +150,24 @@ async def index() -> HTMLResponse:
 
 _VALID_QUALITY = {"turbo", "full"}
 _VALID_ENGINES = {"mlx", "faster-whisper"}
-_VALID_LANGS = {None, "", "auto", "en", "tr", "hu", "de", "fr", "es", "it", "ar", "ru", "zh", "ja"}
+_VALID_LANGS = {
+    None,
+    "",
+    "auto",
+    "en",
+    "tr",
+    "tr-en",
+    "hu",
+    "hu-en",
+    "de",
+    "fr",
+    "es",
+    "it",
+    "ar",
+    "ru",
+    "zh",
+    "ja",
+}
 
 
 def _model_for(engine: str, quality: str) -> str:
@@ -165,6 +186,14 @@ def _parse_speakers(raw: str | None) -> int | None:
     if value < 1 or value > 20:
         raise HTTPException(400, "speakers must be between 1 and 20")
     return value
+
+
+def _language_settings(raw: str | None) -> tuple[str | None, str | None, str]:
+    if raw in (None, "", "auto"):
+        return None, None, "auto"
+    if raw in MIXED_LANGUAGE_PROMPTS:
+        return None, MIXED_LANGUAGE_PROMPTS[raw], raw
+    return raw, None, raw
 
 
 def _copy_upload_with_limit(file: UploadFile, upload_path: Path) -> None:
@@ -196,7 +225,7 @@ async def transcribe_endpoint(
     if language not in _VALID_LANGS:
         raise HTTPException(400, f"unsupported language {language!r}")
 
-    lang = None if language in (None, "", "auto") else language
+    lang, initial_prompt, language_hint = _language_settings(language)
     model = _model_for(engine, quality)
     num_speakers = _parse_speakers(speakers)
 
@@ -215,7 +244,7 @@ async def transcribe_endpoint(
             "progress": 0.0,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
-            "language_hint": lang or "auto",
+            "language_hint": language_hint,
             "engine": engine,
             "model_quality": quality,
             "speaker_hint": num_speakers or "auto",
@@ -227,6 +256,7 @@ async def transcribe_endpoint(
         kwargs={
             "engine": engine,
             "language": lang,
+            "initial_prompt": initial_prompt,
             "model": model,
             "num_speakers": num_speakers,
         },

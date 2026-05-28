@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,14 +37,63 @@ FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "flo
 FASTER_WHISPER_BEAM_SIZE = int(os.environ.get("FASTER_WHISPER_BEAM_SIZE", "5"))
 FASTER_WHISPER_VAD = os.environ.get("FASTER_WHISPER_VAD", "1").lower() not in {"0", "false", "no"}
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float_or_none(name: str, default: float | None) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    if raw.lower() in {"none", "off", "false", "0"}:
+        return None
+    return float(raw)
+
+
+def _env_float_tuple(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    values = tuple(float(v.strip()) for v in raw.split(",") if v.strip())
+    return values or default
+
+
+MLX_CONDITION_ON_PREVIOUS_TEXT = _env_bool("MLX_CONDITION_ON_PREVIOUS_TEXT", False)
+MLX_HALLUCINATION_SILENCE_THRESHOLD = _env_float_or_none(
+    "MLX_HALLUCINATION_SILENCE_THRESHOLD",
+    2.0,
+)
+MLX_TEMPERATURES = _env_float_tuple("MLX_TEMPERATURES", (0.0, 0.2, 0.4, 0.6))
+
 # Per-language initial prompts to bias Whisper toward correct vocab + character
 # set. Especially helps avoid mid-call language flip (greetings in English →
 # rest of call wrongly transcribed in English). Keep short — long prompts can
 # make Whisper paraphrase.
 LANGUAGE_PROMPTS = {
-    "tr": "Türkçe konuşma. İş görüşmesi, yatırımcı toplantısı, teknoloji.",
-    "hu": "Magyar nyelvű beszélgetés. Üzleti megbeszélés.",
+    "tr": (
+        "Turkish business conversation that may include English startup, VC, "
+        "AI, and technology terms. Preserve both Turkish and English words."
+    ),
+    "hu": (
+        "Hungarian business conversation that may include English startup, VC, "
+        "AI, and technology terms. Preserve both Hungarian and English words."
+    ),
     "en": None,  # English is the default training language — no prompt needed
+}
+
+MIXED_LANGUAGE_PROMPTS = {
+    "tr-en": (
+        "Mixed Turkish and English business conversation. Preserve code-switching, "
+        "proper names, startup terms, VC terms, and technology vocabulary exactly."
+    ),
+    "hu-en": (
+        "Mixed Hungarian and English business conversation. Preserve code-switching, "
+        "proper names, startup terms, VC terms, and technology vocabulary exactly."
+    ),
 }
 
 # Smoothing: a one-off short interjection from a different speaker is treated as
@@ -230,10 +279,12 @@ def _transcribe_mlx_whisper(
     kwargs: dict = {
         "path_or_hf_repo": model or WHISPER_MODEL,
         "word_timestamps": True,
-        "condition_on_previous_text": True,
-        "temperature": 0.0,
+        "condition_on_previous_text": MLX_CONDITION_ON_PREVIOUS_TEXT,
+        "temperature": MLX_TEMPERATURES,
         "verbose": False,
     }
+    if MLX_HALLUCINATION_SILENCE_THRESHOLD is not None:
+        kwargs["hallucination_silence_threshold"] = MLX_HALLUCINATION_SILENCE_THRESHOLD
     if language:
         kwargs["language"] = language
     if initial_prompt:
@@ -322,6 +373,63 @@ def _transcribe_faster_whisper(
         "segments": segments,
         "language": getattr(info, "language", language),
     }
+
+
+class TranscriptionQualityError(RuntimeError):
+    """Raised when Whisper returns an obvious hallucination instead of speech."""
+
+
+_WORD_RE = re.compile(r"[0-9A-Za-zÇĞİÖŞÜçğıöşüÁÉÍÓÖŐÚÜŰáéíóöőúüű]+")
+
+
+def _words_for_quality_check(whisper_result: dict) -> list[str]:
+    text = whisper_result.get("text") or " ".join(
+        str(seg.get("text", "")) for seg in whisper_result.get("segments", [])
+    )
+    return [w.casefold() for w in _WORD_RE.findall(text)]
+
+
+def _detect_repetition_hallucination(whisper_result: dict) -> str | None:
+    """Return a human-readable reason if the transcript is clearly bogus."""
+    words = _words_for_quality_check(whisper_result)
+    if len(words) < 120:
+        return None
+
+    counts = Counter(words)
+    top_word, top_count = counts.most_common(1)[0]
+    top_ratio = top_count / len(words)
+    unique_ratio = len(counts) / len(words)
+
+    segment_texts = [
+        str(seg.get("text", "")).strip().casefold()
+        for seg in whisper_result.get("segments", [])
+        if str(seg.get("text", "")).strip()
+    ]
+    repeated_greeting_segments = sum(
+        1
+        for text in segment_texts
+        if text.count("merhaba") >= 3 or text.count("hello") >= 3 or text.count("hi") >= 3
+    )
+
+    if top_ratio >= 0.35 and unique_ratio <= 0.12:
+        return (
+            f"Whisper repetition loop detected: '{top_word}' is "
+            f"{top_ratio:.0%} of all words and vocabulary diversity is "
+            f"{unique_ratio:.0%}."
+        )
+    if repeated_greeting_segments >= 5 and top_word in {"merhaba", "hello", "hi"}:
+        return f"Whisper greeting loop detected: repeated '{top_word}' across many segments."
+    return None
+
+
+def assert_transcription_quality(whisper_result: dict) -> None:
+    reason = _detect_repetition_hallucination(whisper_result)
+    if reason:
+        raise TranscriptionQualityError(
+            reason
+            + " The transcript was rejected instead of being saved. "
+            + "Use the mixed-language option or faster-whisper/CUDA for this file."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -546,6 +654,7 @@ def transcribe_file(
     src: Path,
     *,
     output_dir: Path,
+    source_name: str | None = None,
     progress: ProgressCb | None = None,
     engine: TranscriptionEngine | None = None,
     language: str | None = None,
@@ -596,6 +705,7 @@ def transcribe_file(
             language=language,
             initial_prompt=initial_prompt,
         )
+        assert_transcription_quality(whisper_result)
 
         _p("Assigning speakers per word…", 0.92)
         blocks = merge_segments_with_speakers(whisper_result, turns)
@@ -604,17 +714,18 @@ def transcribe_file(
         if whisper_result.get("segments"):
             duration = max(duration, float(whisper_result["segments"][-1]["end"]))
 
+        display_name = source_name or src.stem
         md = to_markdown(
             blocks,
-            source_name=src.stem,
+            source_name=display_name,
             language=whisper_result.get("language"),
             duration_seconds=duration,
         )
 
-        out_path = output_dir / f"{src.stem}.md"
+        out_path = output_dir / f"{display_name}.md"
         n = 1
         while out_path.exists():
-            out_path = output_dir / f"{src.stem}-{n}.md"
+            out_path = output_dir / f"{display_name}-{n}.md"
             n += 1
         out_path.write_text(md, encoding="utf-8")
 

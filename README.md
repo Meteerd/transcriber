@@ -22,7 +22,7 @@ For best multilingual meeting quality:
 - **Apple Silicon runtime:** `mlx-whisper`.
 - **NVIDIA runtime:** `faster-whisper` / CTranslate2 with `float16`.
 - **Diarization:** `pyannote/speaker-diarization-3.1`.
-- **Best practical setting:** set the language explicitly and set the exact speaker count when known.
+- **Best practical setting:** set the language mode and exact speaker count when known. For code-switched calls, use `tr-en` or `hu-en` instead of forcing only one language.
 
 For English-only benchmarking on NVIDIA GPUs, also test NVIDIA Parakeet/Canary outside this app. They are promising, but Whisper large-v3 remains the safest baseline for multilingual meeting notes.
 
@@ -73,7 +73,7 @@ from the official PyTorch cu128 wheel index so torch recognizes `sm_120`.
 CLI example for a two-person investor call:
 
 ```bash
-./cli.sh --engine faster-whisper --quality full --lang tr --speakers 2 call.m4a
+./cli.sh --engine faster-whisper --quality full --lang tr-en --speakers 2 call.m4a
 ```
 
 ## Use
@@ -88,7 +88,7 @@ CLI:
 
 ```bash
 ./cli.sh --lang en --quality turbo meeting.m4a
-./cli.sh --lang tr --quality full --speakers 2 investor-call.m4a
+./cli.sh --lang tr-en --quality full --speakers 2 investor-call.m4a
 ./cli.sh --engine faster-whisper --quality full --speakers 2 meeting.m4a
 ```
 
@@ -117,7 +117,10 @@ Download both MLX models:
 - `turbo` maps to `mlx-community/whisper-large-v3-turbo` on MLX and `large-v3-turbo` on faster-whisper.
 - `full` maps to `mlx-community/whisper-large-v3-mlx` on MLX and `large-v3` on faster-whisper.
 - Turkish/Hungarian important calls should usually use `--quality full` plus `--lang tr` or `--lang hu`.
+- Mixed Turkish/English or Hungarian/English calls should use `--lang tr-en` or `--lang hu-en`; this avoids over-forcing one language while still giving Whisper meeting context.
 - Speaker labels improve when you pass `--speakers 2` for two-person calls.
+- MLX disables `condition_on_previous_text` by default because it can cause long repetition loops on difficult audio. Set `MLX_CONDITION_ON_PREVIOUS_TEXT=1` only if you specifically want to experiment.
+- Obvious Whisper repetition loops are rejected instead of being saved as finished transcripts.
 
 ## What This Is Not
 
