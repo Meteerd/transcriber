@@ -688,22 +688,30 @@ async function poll(jobId) {
 
 async function upload(file) {
   const tmpId = "tmp-" + Math.random().toString(36).slice(2);
+  const selectedEngine = document.getElementById("engine").value;
+  const selectedLanguage = document.getElementById("language").value;
+  const selectedQuality = document.getElementById("quality").value;
+  const selectedSpeakers = document.getElementById("speakers").value;
   render({
     id: tmpId,
     original_name: file.name,
     status: "queued",
     stage: "Uploading…",
     progress: 0.02,
+    engine: selectedEngine,
+    language_hint: selectedLanguage,
+    model_quality: selectedQuality,
+    speaker_hint: selectedSpeakers,
   });
   const tmpNode = jobsView.get(tmpId);
   jobsView.delete(tmpId);
 
   const fd = new FormData();
 	  fd.append("file", file);
-	  fd.append("engine", document.getElementById("engine").value);
-	  fd.append("language", document.getElementById("language").value);
-	  fd.append("quality", document.getElementById("quality").value);
-	  fd.append("speakers", document.getElementById("speakers").value);
+		  fd.append("engine", selectedEngine);
+		  fd.append("language", selectedLanguage);
+		  fd.append("quality", selectedQuality);
+		  fd.append("speakers", selectedSpeakers);
   try {
     const r = await fetch("/transcribe", { method: "POST", body: fd });
     if (!r.ok) throw new Error("upload failed: HTTP " + r.status);
