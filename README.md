@@ -94,6 +94,24 @@ CLI:
 
 Outputs are saved under `./transcripts/`.
 
+## Prefetch Models
+
+The first use of a model downloads weights into the Hugging Face cache. That
+cache survives app restarts, but a first full-v3 run may spend several minutes
+downloading about 3 GB before transcription starts.
+
+Download the quality-first MLX model ahead of time:
+
+```bash
+./prefetch.sh --quality full
+```
+
+Download both MLX models:
+
+```bash
+./prefetch.sh --quality all
+```
+
 ## Model Notes
 
 - `turbo` maps to `mlx-community/whisper-large-v3-turbo` on MLX and `large-v3-turbo` on faster-whisper.

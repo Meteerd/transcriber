@@ -131,18 +131,68 @@
   .job.done .badge { color: var(--good); border-color: rgba(86, 211, 100, 0.3); background: rgba(86, 211, 100, 0.08); }
   .job.error .badge { color: var(--err); border-color: rgba(244, 112, 103, 0.3); background: rgba(244, 112, 103, 0.08); }
 
-  .stage { color: var(--muted); font-size: 12px; margin-top: 6px; min-height: 16px; }
+  .job-meta-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-top: 8px; color: var(--muted); font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stage {
+    color: var(--text); font-size: 13px; min-height: 18px;
+    overflow-wrap: anywhere;
+  }
+  .elapsed { color: var(--muted-2); flex-shrink: 0; }
+  .stage-hint {
+    color: var(--muted); font-size: 12px; margin-top: 6px;
+    min-height: 18px; overflow-wrap: anywhere;
+  }
+  .progress-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-top: 12px;
+  }
+  .progress-label {
+    color: var(--muted-2); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .pct {
+    color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums;
+  }
   .bar {
-    height: 3px; background: var(--bg-2); border-radius: 2px;
-    overflow: hidden; margin-top: 10px;
+    height: 8px; background: #0d0e12; border-radius: 999px;
+    overflow: hidden; margin-top: 6px; border: 1px solid rgba(255,255,255,0.04);
   }
   .bar > div {
     height: 100%; width: 0;
     background: linear-gradient(90deg, var(--accent), #d4b5ff);
     transition: width 0.5s ease;
   }
+  .job.running .bar > div {
+    background-image: linear-gradient(
+      90deg,
+      var(--accent) 0%,
+      #d4b5ff 45%,
+      var(--accent) 90%
+    );
+    background-size: 180% 100%;
+    animation: progress-sheen 1.4s ease-in-out infinite;
+  }
+  @keyframes progress-sheen {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
   .job.done .bar > div { background: var(--good); }
   .job.error .bar > div { background: var(--err); }
+  .steps {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 6px; margin-top: 10px;
+  }
+  .step {
+    min-width: 0; padding-top: 6px; border-top: 2px solid var(--border);
+    color: var(--muted-2); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.08em; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .step.active { color: var(--accent); border-color: var(--accent); }
+  .step.done { color: var(--good); border-color: rgba(86, 211, 100, 0.7); }
 
   .summary {
     color: var(--muted); font-size: 12px; margin-top: 10px;
@@ -324,6 +374,7 @@ const toast = document.getElementById("toast");
 
 const jobsView = new Map();   // job_id -> DOM node
 const jobsState = new Map();  // job_id -> latest server state
+const pollFailures = new Map(); // job_id -> consecutive failed polls
 let lastNames = {};           // remembered SPEAKER_NN -> name from previous renames
 
 fetch("/last-names").then(r => r.json()).then(d => lastNames = d || {}).catch(() => {});
@@ -352,8 +403,23 @@ function render(state) {
         <span class="job-name"></span>
         <span class="badge"></span>
       </div>
-      <div class="stage"></div>
+      <div class="job-meta-row">
+        <div class="stage"></div>
+        <div class="elapsed"></div>
+      </div>
+      <div class="stage-hint"></div>
+      <div class="progress-head">
+        <span class="progress-label">Progress</span>
+        <span class="pct"></span>
+      </div>
       <div class="bar"><div></div></div>
+      <div class="steps">
+        <span class="step" data-step="prepare">Audio</span>
+        <span class="step" data-step="diarize">Speakers</span>
+        <span class="step" data-step="transcribe">Words</span>
+        <span class="step" data-step="assign">Labels</span>
+        <span class="step" data-step="done">Done</span>
+      </div>
       <div class="summary"></div>
       <div class="actions">
         <button class="primary copy">
@@ -379,12 +445,17 @@ function render(state) {
   }
   jobsState.set(state.id, state);
 
-  node.className = "job " + (state.status || "queued");
-  node.querySelector(".job-name").textContent = state.original_name;
-  node.querySelector(".badge").textContent = state.status;
-  node.querySelector(".stage").textContent = state.stage || "";
-  const pct = state.status === "done" ? 100 : Math.round((state.progress || 0) * 100);
-  node.querySelector(".bar > div").style.width = pct + "%";
+	  node.className = "job " + (state.status || "queued");
+	  node.querySelector(".job-name").textContent = state.original_name;
+	  node.querySelector(".badge").textContent = state.status;
+	  node.querySelector(".stage").textContent = state.stage || "";
+	  const pct = state.status === "done" ? 100 : Math.round((state.progress || 0) * 100);
+	  const visiblePct = state.status === "running" ? Math.max(pct, 3) : pct;
+	  node.querySelector(".bar > div").style.width = visiblePct + "%";
+	  node.querySelector(".pct").textContent = `${pct}%`;
+	  node.querySelector(".elapsed").textContent = elapsedLabel(state);
+	  node.querySelector(".stage-hint").textContent = stageHint(state);
+	  paintSteps(node, state);
 
   const summary = node.querySelector(".summary");
   if (state.status === "done") {
@@ -489,22 +560,126 @@ function render(state) {
         applyBtn.disabled = false; applyBtn.textContent = "Apply";
       }
     };
-  } else if (state.status === "error") {
-    summary.textContent = "Error: " + (state.error || "unknown");
-  } else {
-    summary.textContent = "";
-  }
-}
+	  } else if (state.status === "error") {
+	    summary.textContent = "Error: " + (state.error || "unknown");
+	  } else {
+	    summary.innerHTML = "";
+	    progressParts(state).forEach(p => {
+	      const s = document.createElement("span");
+	      s.textContent = p;
+	      summary.appendChild(s);
+	    });
+	  }
+	}
+
+	const STEP_ORDER = ["prepare", "diarize", "transcribe", "assign", "done"];
+
+	function currentStep(state) {
+	  if (state.status === "done") return "done";
+	  if (state.status === "queued") return "queued";
+	  if (state.stage_key) return state.stage_key;
+	  const stage = (state.stage || "").toLowerCase();
+	  if (stage.includes("diarization")) return "diarize";
+	  if (stage.includes("transcribing") || stage.includes("model")) return "transcribe";
+	  if (stage.includes("assigning")) return "assign";
+	  if (stage.includes("preparing") || stage.includes("upload")) return "prepare";
+	  return "queued";
+	}
+
+	function paintSteps(node, state) {
+	  const step = currentStep(state);
+	  const idx = STEP_ORDER.indexOf(step);
+	  node.querySelectorAll(".step").forEach(el => {
+	    const i = STEP_ORDER.indexOf(el.dataset.step);
+	    el.classList.toggle("active", state.status === "running" && i === idx);
+	    el.classList.toggle("done", state.status === "done" || (idx >= 0 && i < idx));
+	  });
+	}
+
+	function parseTs(s) {
+	  const t = s ? Date.parse(s) : NaN;
+	  return Number.isFinite(t) ? t : null;
+	}
+
+	function elapsedLabel(state) {
+	  const start = parseTs(state.started_at || state.created_at);
+	  if (!start) return "";
+	  const end = parseTs(state.finished_at) || Date.now();
+	  return `elapsed ${fmtDur(Math.max(0, (end - start) / 1000))}`;
+	}
+
+	function progressParts(state) {
+	  const parts = [
+	    state.engine || "mlx",
+	    state.model_quality === "full" ? "full-v3" : "turbo",
+	    state.language_hint || state.language || "auto",
+	  ];
+	  if (state.speaker_hint && state.speaker_hint !== "auto") parts.push(`${state.speaker_hint} speakers`);
+	  return parts;
+	}
+
+	function stageHint(state) {
+	  if (state.status === "queued") return "Waiting to start.";
+	  if (state.status === "error") return "The job stopped before a transcript was written. The error below is from the backend.";
+	  if (state.status === "done") return "Transcript is ready.";
+
+	  const step = currentStep(state);
+	  const elapsed = Math.max(0, ((Date.now() - (parseTs(state.started_at) || Date.now())) / 1000));
+	  if (step === "prepare") {
+	    return "Converting the source file to clean 16 kHz mono WAV. Large phone recordings can take a minute or two.";
+	  }
+	  if (step === "diarize") {
+	    return "Detecting speaker turns with pyannote. This is often the slowest local step and can sit here for several minutes.";
+	  }
+	  if (step === "transcribe") {
+	    if (state.model_quality === "full") {
+	      return "Running full large-v3 for best quality. First run may download about 3 GB, then transcription starts.";
+	    }
+	    return "Running Whisper transcription and word timestamps. First use of a model can include a one-time download.";
+	  }
+	  if (step === "assign") {
+	    return "Combining Whisper words with speaker turns and writing Markdown.";
+	  }
+	  if (elapsed > 60) {
+	    return "Still working. Long files may stay on the same backend stage for a while.";
+	  }
+	  return "Starting the local pipeline.";
+	}
 
 async function poll(jobId) {
   try {
     const r = await fetch(`/jobs/${jobId}`);
+    if (r.status === 404) {
+      const prev = jobsState.get(jobId) || { id: jobId, original_name: "Unknown file" };
+      render({
+        ...prev,
+        status: "error",
+        stage: "Job no longer exists",
+        error: "The server restarted or the in-memory job was lost. Start this file again.",
+        finished_at: new Date().toISOString(),
+      });
+      return;
+    }
     if (!r.ok) throw new Error("status " + r.status);
     const state = await r.json();
+    pollFailures.set(jobId, 0);
     render(state);
     if (state.status === "done" || state.status === "error") return;
   } catch (e) {
     console.error(e);
+    const failures = (pollFailures.get(jobId) || 0) + 1;
+    pollFailures.set(jobId, failures);
+    if (failures >= 3) {
+      const prev = jobsState.get(jobId) || { id: jobId, original_name: "Unknown file" };
+      render({
+        ...prev,
+        status: "error",
+        stage: "Server connection lost",
+        error: "The local server stopped responding. Check the terminal, then restart the app and run the file again if needed.",
+        finished_at: new Date().toISOString(),
+      });
+      return;
+    }
   }
   setTimeout(() => poll(jobId), 1500);
 }

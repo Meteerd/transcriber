@@ -47,6 +47,21 @@ _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
 
+def _stage_key(stage: str) -> str:
+    s = stage.lower()
+    if "preparing" in s or "audio" in s:
+        return "prepare"
+    if "diarization" in s:
+        return "diarize"
+    if "transcribing" in s or "model" in s:
+        return "transcribe"
+    if "assigning" in s:
+        return "assign"
+    if "done" in s:
+        return "done"
+    return "queued"
+
+
 def _update_job(job_id: str, **kv: Any) -> None:
     with _jobs_lock:
         _jobs[job_id].update(kv)
@@ -63,11 +78,22 @@ def _run_job(
     num_speakers: int | None = None,
 ) -> None:
     def progress(stage: str, frac: float | None) -> None:
-        _update_job(job_id, stage=stage, progress=frac)
+        _update_job(
+            job_id,
+            stage=stage,
+            stage_key=_stage_key(stage),
+            progress=frac,
+            updated_at=datetime.now().isoformat(),
+        )
         log.info("[%s] %s %s", job_id[:8], stage, f"({frac*100:.0f}%)" if frac else "")
 
     try:
-        _update_job(job_id, status="running", started_at=datetime.now().isoformat())
+        _update_job(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
         out_path, result = transcribe_file(
             upload_path,
             output_dir=TRANSCRIPTS,
@@ -81,6 +107,8 @@ def _run_job(
             job_id,
             status="done",
             finished_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            stage_key="done",
             transcript_path=str(out_path),
             transcript_name=out_path.name,
             markdown=result.markdown,
@@ -93,7 +121,13 @@ def _run_job(
         log.info("[%s] complete → %s", job_id[:8], out_path)
     except Exception as e:
         log.exception("[%s] failed", job_id[:8])
-        _update_job(job_id, status="error", error=str(e), finished_at=datetime.now().isoformat())
+        _update_job(
+            job_id,
+            status="error",
+            error=str(e),
+            finished_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
     finally:
         # Best-effort cleanup of upload
         try:
@@ -180,6 +214,7 @@ async def transcribe_endpoint(
             "stage": "Queued",
             "progress": 0.0,
             "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
             "language_hint": lang or "auto",
             "engine": engine,
             "model_quality": quality,

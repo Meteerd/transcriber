@@ -588,7 +588,7 @@ def transcribe_file(
             max_speakers=max_speakers,
         )
 
-        _p(f"Transcribing with {selected_engine} / {model_label}…", 0.55)
+        _p(f"Loading model and transcribing with {selected_engine} / {model_label}…", 0.55)
         whisper_result = transcribe_segments(
             wav,
             engine=selected_engine,
