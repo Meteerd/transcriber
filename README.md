@@ -48,6 +48,13 @@ Start the local UI:
 
 Open <http://127.0.0.1:8765>. The server only binds to localhost.
 
+To expose the UI only on a trusted private interface such as Tailscale, set the
+host explicitly:
+
+```bash
+TRANSCRIBER_HOST=100.x.y.z ./run.sh
+```
+
 ## Setup: NVIDIA / CUDA
 
 On Linux with a recent NVIDIA driver:
@@ -82,6 +89,12 @@ Web UI:
 
 ```bash
 ./run.sh
+```
+
+Tailscale/LAN UI:
+
+```bash
+TRANSCRIBER_HOST=100.x.y.z ./run.sh
 ```
 
 CLI:
