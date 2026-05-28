@@ -293,7 +293,7 @@
       <h1>Transcriber</h1>
       <span class="tag">local</span>
     </div>
-    <span class="meta">whisper · pyannote · MLX</span>
+    <span class="meta">whisper large-v3 · pyannote · CUDA/MLX</span>
   </header>
 
 	  <div class="options">
@@ -301,7 +301,7 @@
 	      <label for="engine">Engine</label>
 	      <select id="engine">
 	        <option value="mlx">MLX (Apple Silicon)</option>
-	        <option value="faster-whisper">CUDA / CPU</option>
+	        <option value="faster-whisper">CUDA / CPU (large-v3 runtime)</option>
 	      </select>
 	    </div>
 	    <div class="opt">
@@ -395,6 +395,16 @@ function fmtDur(sec) {
   return h ? `${h}h ${m}m` : (m ? `${m}m ${s}s` : `${s}s`);
 }
 
+function engineLabel(engine) {
+  if (engine === "faster-whisper") return "CUDA/CPU CTranslate2";
+  if (engine === "mlx") return "MLX Apple Silicon";
+  return engine || "auto";
+}
+
+function qualityLabel(quality) {
+  return quality === "full" ? "large-v3 full quality" : "large-v3-turbo";
+}
+
 function render(state) {
   let node = jobsView.get(state.id);
   if (!node) {
@@ -467,8 +477,8 @@ function render(state) {
       `${state.num_blocks} segment${state.num_blocks === 1 ? "" : "s"}`,
 	      fmtDur(state.duration_seconds),
 	      (state.language || "auto"),
-	      (state.engine || "mlx"),
-	      (state.model_quality === "full" ? "full-v3" : "turbo"),
+	      engineLabel(state.engine || "mlx"),
+	      qualityLabel(state.model_quality),
 	    ];
     parts.forEach(p => {
       const s = document.createElement("span");
@@ -612,8 +622,8 @@ function render(state) {
 
 	function progressParts(state) {
 	  const parts = [
-	    state.engine || "mlx",
-	    state.model_quality === "full" ? "full-v3" : "turbo",
+	    engineLabel(state.engine || "mlx"),
+	    qualityLabel(state.model_quality),
 	    state.language_hint || state.language || "auto",
 	  ];
 	  if (state.speaker_hint && state.speaker_hint !== "auto") parts.push(`${state.speaker_hint} speakers`);
@@ -635,9 +645,9 @@ function render(state) {
 	  }
 	  if (step === "transcribe") {
 	    if (state.model_quality === "full") {
-	      return "Running full large-v3 for best quality. First run may download about 3 GB, then transcription starts.";
+	      return "Running the full Whisper large-v3 model for best quality. On NVIDIA this uses faster-whisper/CTranslate2 as the CUDA runtime.";
 	    }
-	    return "Running Whisper transcription and word timestamps. First use of a model can include a one-time download.";
+	    return "Running Whisper transcription and word timestamps. Turbo is faster, full large-v3 is higher quality.";
 	  }
 	  if (step === "assign") {
 	    return "Combining Whisper words with speaker turns and writing Markdown.";

@@ -250,6 +250,9 @@ def transcribe_segments(
     model: str | None = None,
     language: str | None = None,
     initial_prompt: str | None = None,
+    progress: ProgressCb | None = None,
+    progress_start: float = 0.55,
+    progress_end: float = 0.90,
 ) -> dict:
     """Transcribe with word_timestamps. Returns Whisper-shaped segment dicts.
 
@@ -270,6 +273,9 @@ def transcribe_segments(
             model=model,
             language=language,
             initial_prompt=initial_prompt,
+            progress=progress,
+            progress_start=progress_start,
+            progress_end=progress_end,
         )
 
     return _transcribe_mlx_whisper(
@@ -355,9 +361,14 @@ def _transcribe_faster_whisper(
     model: str | None,
     language: str | None,
     initial_prompt: str | None,
+    progress: ProgressCb | None,
+    progress_start: float,
+    progress_end: float,
 ) -> dict:
     """Transcribe with faster-whisper/CTranslate2 on CUDA or CPU."""
     fw_model = _get_faster_whisper_model(model)
+    model_label = (model or FASTER_WHISPER_MODEL_TURBO).rsplit("/", 1)[-1]
+    device_label = _resolve_faster_whisper_device().upper()
     kwargs: dict = {
         "beam_size": FASTER_WHISPER_BEAM_SIZE,
         "word_timestamps": True,
@@ -370,6 +381,8 @@ def _transcribe_faster_whisper(
         kwargs["initial_prompt"] = initial_prompt
 
     segments_iter, info = fw_model.transcribe(str(wav_path), **kwargs)
+    duration = float(getattr(info, "duration_after_vad", 0.0) or getattr(info, "duration", 0.0) or 0.0)
+    progress_span = max(0.0, progress_end - progress_start)
     segments = []
     for idx, seg in enumerate(segments_iter):
         words = [
@@ -389,6 +402,12 @@ def _transcribe_faster_whisper(
             "text": seg.text,
             "words": words,
         })
+        if progress and duration > 0:
+            done_ratio = min(max(float(seg.end) / duration, 0.0), 1.0)
+            progress(
+                f"Transcribing with {device_label} / {model_label} ({_fmt_ts(seg.end)} / {_fmt_ts(duration)})…",
+                min(progress_start + done_ratio * progress_span, progress_end),
+            )
 
     return {
         "text": " ".join(s["text"].strip() for s in segments if s["text"].strip()),
@@ -726,6 +745,7 @@ def transcribe_file(
             model=model,
             language=language,
             initial_prompt=initial_prompt,
+            progress=progress,
         )
         assert_transcription_quality(whisper_result)
 
