@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -44,8 +45,10 @@ _ROUTER: dict[str, tuple[str, str, str | None]] = {
     "hu":    ("chunked", "canary",   "hu"),
     "hu-en": ("wordts",  "parakeet", None),
     "tr":    ("chunked", "qwen",     "Turkish"),
-    "tr-en": ("chunked", "qwen",     None),
-    "tr-hu": ("chunked", "qwen",     None),
+    # Force the dominant language so Qwen can't misdetect short turns into a
+    # random language; its LLM decoder + glossary still keep embedded EN/Latin.
+    "tr-en": ("chunked", "qwen",     "Turkish"),
+    "tr-hu": ("chunked", "qwen",     "Turkish"),
     "de":    ("wordts",  "parakeet", "de"),
     "fr":    ("wordts",  "parakeet", "fr"),
     "es":    ("wordts",  "parakeet", "es"),
@@ -55,8 +58,9 @@ _ROUTER: dict[str, tuple[str, str, str | None]] = {
     "zh":    ("chunked", "qwen",     "Chinese"),
     "ja":    ("chunked", "qwen",     "Japanese"),
 }
-# auto / unknown -> Qwen (broadest coverage incl. Turkish, plus context biasing)
-_DEFAULT_ROUTE = ("chunked", "qwen", None)
+# auto / unknown -> Parakeet whole-file (robust, word-level, no per-turn language
+# misdetection). Turkish must be picked explicitly from the dropdown (-> Qwen).
+_DEFAULT_ROUTE = ("wordts", "parakeet", None)
 
 
 @dataclass
@@ -161,6 +165,31 @@ def diarize(wav: Path) -> list[Turn]:
     return turns
 
 
+def _limit_speakers(turns: list[Turn], n: int | None) -> list[Turn]:
+    """Honor the UI's Speakers count: if Sortformer found more speakers than the
+    user specified, keep the n most-active and reassign the rest to the nearest
+    kept speaker by time. (Sortformer has no native speaker-count input.)"""
+    if not turns or not n or n < 1:
+        return turns
+    dur: dict[str, float] = {}
+    for t in turns:
+        dur[t.speaker] = dur.get(t.speaker, 0.0) + (t.end - t.start)
+    if len(dur) <= n:
+        return turns
+    keep = set(sorted(dur, key=dur.get, reverse=True)[:n])
+    kept = [t for t in turns if t.speaker in keep]
+    out: list[Turn] = []
+    for t in turns:
+        if t.speaker in keep:
+            out.append(t)
+        else:
+            mid = (t.start + t.end) / 2
+            near = min(kept, key=lambda k: min(abs(k.start - mid), abs(k.end - mid)))
+            out.append(Turn(t.start, t.end, near.speaker))
+    log.info("Limited speakers %d -> %d (kept %s)", len(dur), n, sorted(keep))
+    return out
+
+
 def _speaker_at(t: float, turns: list[Turn]) -> str:
     for tr in turns:
         if tr.start <= t <= tr.end:
@@ -199,6 +228,8 @@ def _blocks_from_wordts(words: list[dict], turns: list[Turn]) -> list[Block]:
         s, e = float(w["start"]), float(w["end"])
         spk = _speaker_at((s + e) / 2, turns)
         tok = str(w["word"])
+        if _WRONG_SCRIPT.search(tok):  # drop Devanagari/CJK hallucinations
+            continue
         if raw and raw[-1].speaker == spk:
             raw[-1].end = e
             raw[-1].text = (raw[-1].text + " " + tok).strip()
@@ -251,6 +282,14 @@ def _load_audio(wav: Path):
     return data, sr
 
 
+# Latin-script languages we route through the chunked path. If a transcript for
+# one of these comes back full of Devanagari/CJK, it's a short-turn hallucination.
+_WRONG_SCRIPT = re.compile(r"[ऀ-ॿ぀-ヿ一-鿿฀-๿]")
+# Turns shorter than this are too little signal for the LLM/AED decoders and tend
+# to hallucinate; drop them rather than emit garbage.
+_MIN_CHUNK_S = float(os.environ.get("MIN_CHUNK_S", "0.6"))
+
+
 def _asr_chunked(wav: Path, turns: list[Turn], model_key: str,
                  force_lang: str | None, context: str) -> list[Block]:
     """Canary/Qwen path: transcribe each merged speaker turn independently, so
@@ -265,7 +304,7 @@ def _asr_chunked(wav: Path, turns: list[Turn], model_key: str,
     for tr in merged:
         a = max(0, int(tr.start * sr))
         b = min(len(data), int(tr.end * sr))
-        if b - a < int(0.2 * sr):  # skip sub-200ms slivers
+        if b - a < int(_MIN_CHUNK_S * sr):  # too short -> skip (hallucination risk)
             continue
         clip = data[a:b]
         if model_key == "qwen":
@@ -279,8 +318,13 @@ def _asr_chunked(wav: Path, turns: list[Turn], model_key: str,
                                         target_lang=force_lang or "en", pnc="yes")
                 h = out[0]
                 text = (getattr(h, "text", None) or str(h)).strip()
+        # Drop wrong-script hallucinations on a Latin-language route.
+        if text and _WRONG_SCRIPT.search(text):
+            log.info("dropping wrong-script hallucination at %.1fs: %r", tr.start, text[:40])
+            text = ""
         if text:
             blocks.append(Block(tr.speaker, tr.start, tr.end, text))
+    blocks.sort(key=lambda b: b.start)
     return blocks
 
 
@@ -322,6 +366,7 @@ def transcribe_file(
 
         _p("Running speaker diarization (Sortformer v2.1)…", 0.15)
         turns = diarize(wav)
+        turns = _limit_speakers(turns, num_speakers)
         dist: dict[str, float] = {}
         for t in turns:
             dist[t.speaker] = dist.get(t.speaker, 0.0) + (t.end - t.start)
