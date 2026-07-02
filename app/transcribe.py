@@ -11,6 +11,7 @@ Flow:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
+
+log = logging.getLogger("transcriber")
 
 WHISPER_MODEL_TURBO = "mlx-community/whisper-large-v3-turbo"
 WHISPER_MODEL_FULL = "mlx-community/whisper-large-v3-mlx"
@@ -33,6 +36,19 @@ DIARIZATION_MODEL = os.environ.get(
     "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
 )
 DIARIZATION_DEVICE = os.environ.get("DIARIZATION_DEVICE", "auto").lower()
+# Embedding model used to stitch speaker identities across chunks (see
+# _diarize_chunked). Same model pyannote 3.1 uses internally for embeddings.
+EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL", "pyannote/wespeaker-voxceleb-resnet34-LM"
+)
+# Long recordings are diarized in windows then stitched, because pyannote's
+# global clustering collapses to a single speaker on long, monologue-heavy
+# files (measured: a 37-min 2-person call diarized as 98%/2% in one pass but
+# 28%/72% when chunked). Files at or below the chunk length use a single pass.
+DIARIZATION_CHUNK_SECONDS = float(os.environ.get("DIARIZATION_CHUNK_SECONDS", "480"))
+# Cosine-distance threshold for grouping per-chunk speakers into global speakers
+# when the speaker count is unknown (auto). Lower = more speakers.
+DIARIZATION_STITCH_THRESHOLD = float(os.environ.get("DIARIZATION_STITCH_THRESHOLD", "0.55"))
 FASTER_WHISPER_DEVICE = os.environ.get("FASTER_WHISPER_DEVICE", "auto").lower()
 FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "float16")
 FASTER_WHISPER_BEAM_SIZE = int(os.environ.get("FASTER_WHISPER_BEAM_SIZE", "5"))
@@ -110,6 +126,7 @@ ProgressCb = Callable[[str, float | None], None]  # (stage, fraction 0..1 or Non
 # Pyannote pipeline (loaded lazily, kept in memory across requests)
 # --------------------------------------------------------------------------- #
 _diarizer = None
+_embedder = None
 _faster_whisper_models: dict[tuple[str, str, str], object] = {}
 
 
@@ -139,6 +156,27 @@ def _get_diarizer():
             pipeline.to(torch.device(device))
         _diarizer = pipeline
     return _diarizer
+
+
+def _get_embedder():
+    """Speaker-embedding inference, used to stitch per-chunk speakers into global
+    identities. Cached across requests. Returns a callable Inference(window=whole)."""
+    global _embedder
+    if _embedder is None:
+        import torch
+        import torchaudio
+
+        if not hasattr(torchaudio, "AudioMetaData"):
+            torchaudio.AudioMetaData = object
+        from pyannote.audio import Inference, Model
+
+        model = Model.from_pretrained(EMBEDDING_MODEL, use_auth_token=HF_TOKEN)
+        inference = Inference(model, window="whole")
+        device = _resolve_torch_device(torch, DIARIZATION_DEVICE)
+        if device != "cpu":
+            inference.to(torch.device(device))
+        _embedder = inference
+    return _embedder
 
 
 def _resolve_torch_device(torch_module, requested: str) -> str:
@@ -172,27 +210,47 @@ def _ffmpeg_binary() -> str:
         return "ffmpeg"
 
 
-def to_wav_16k_mono(src: Path, dst: Path) -> Path:
-    """Decode to 16 kHz mono PCM WAV with phone-recording-friendly cleanup:
+# Heavy chain for ASR. Whisper transcribes better when the quiet speaker is
+# leveled up, so we keep dynamic + loudness normalization here.
+ASR_AUDIO_FILTER = "highpass=f=80,dynaudnorm=f=200:g=15,loudnorm=I=-16:TP=-1.5:LRA=11"
 
-    - highpass 80 Hz: kill HVAC/handling rumble that confuses VAD
-    - dynaudnorm: gentle dynamic range compression so the quiet speaker doesn't disappear
-    - loudnorm (EBU R128): even out volume across speakers / recording distances
+# Light chain for diarization: highpass ONLY. dynaudnorm/loudnorm flatten the
+# per-speaker volume + spectral cues pyannote clusters on, and can collapse a
+# multi-person call onto one speaker. Measured on a real stereo VC recording:
+# the heavy chain gave a 95%/5% (one speaker swallows everything) split, while
+# highpass-only gave a healthy 64%/36% two-speaker split. Both chains are
+# time-preserving (no resampling/trim), so word timestamps from the ASR wav
+# still line up with diarization turns from this one.
+DIARIZATION_AUDIO_FILTER = "highpass=f=70"
+
+
+def _ffmpeg_to_wav(src: Path, dst: Path, audio_filter: str) -> Path:
+    """Decode any input to 16 kHz mono PCM WAV applying ``audio_filter``.
 
     Note: we don't run a learned denoiser (DeepFilterNet etc.) — those have been
     shown to *degrade* Whisper WER by stripping frequencies the model relies on.
     """
-    af = "highpass=f=80,dynaudnorm=f=200:g=15,loudnorm=I=-16:TP=-1.5:LRA=11"
     cmd = [
         _ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src),
         "-ac", "1", "-ar", "16000",
-        "-af", af,
+        "-af", audio_filter,
         "-c:a", "pcm_s16le",
         str(dst),
     ]
     subprocess.run(cmd, check=True)
     return dst
+
+
+def to_wav_16k_mono(src: Path, dst: Path) -> Path:
+    """ASR-oriented decode: 16 kHz mono + highpass + dynaudnorm + loudnorm."""
+    return _ffmpeg_to_wav(src, dst, ASR_AUDIO_FILTER)
+
+
+def to_wav_16k_mono_for_diarization(src: Path, dst: Path) -> Path:
+    """Diarization-oriented decode: 16 kHz mono + highpass only (no level
+    normalization), preserving the cues pyannote needs to separate speakers."""
+    return _ffmpeg_to_wav(src, dst, DIARIZATION_AUDIO_FILTER)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +263,57 @@ class Turn:
     speaker: str
 
 
+def _clean_turns(turns: list[Turn]) -> list[Turn]:
+    """Sort and drop zero/near-zero-duration artifacts (pyannote emits these at
+    speaker boundaries; they cause tie-breaking issues in _speaker_at)."""
+    turns.sort(key=lambda t: t.start)
+    return [t for t in turns if (t.end - t.start) >= 0.05]
+
+
+def _annotation_to_turns(annotation, offset: float = 0.0) -> list[Turn]:
+    out: list[Turn] = []
+    for segment, _, speaker in annotation.itertracks(yield_label=True):
+        out.append(Turn(
+            start=float(segment.start) + offset,
+            end=float(segment.end) + offset,
+            speaker=str(speaker),
+        ))
+    return out
+
+
 def diarize(
+    wav_path: Path,
+    *,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[Turn]:
+    """Diarize a WAV. Long files are processed in windows and stitched, because
+    pyannote's global clustering collapses to one speaker on long recordings."""
+    import torchaudio
+
+    if not hasattr(torchaudio, "AudioMetaData"):
+        torchaudio.AudioMetaData = object
+    info = torchaudio.info(str(wav_path))
+    duration = info.num_frames / info.sample_rate
+
+    if duration > DIARIZATION_CHUNK_SECONDS * 1.5:
+        log.info("Long recording (%.0fs) — using chunked diarization", duration)
+        return _diarize_chunked(
+            wav_path,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+    return _diarize_single(
+        wav_path,
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+
+
+def _diarize_single(
     wav_path: Path,
     *,
     num_speakers: int | None = None,
@@ -223,21 +331,182 @@ def diarize(
         if v is not None
     }
     annotation = pipeline(str(wav_path), **kwargs)
-    turns: list[Turn] = []
-    for segment, _, speaker in annotation.itertracks(yield_label=True):
-        turns.append(Turn(start=float(segment.start), end=float(segment.end), speaker=str(speaker)))
-    turns.sort(key=lambda t: t.start)
+    return _clean_turns(_annotation_to_turns(annotation))
+
+
+def _diarize_chunked(
+    wav_path: Path,
+    *,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[Turn]:
+    """Diarize in fixed windows, then stitch per-window speakers into global
+    identities via voice embeddings.
+
+    pyannote's one-pass global clustering collapses on long, imbalanced
+    recordings. Diarizing each window independently keeps each clustering
+    problem small (so it stays accurate), and matching speakers across windows
+    by embedding similarity recovers consistent global speaker labels. Any
+    over-split inside a window (e.g. a monologue window forced to 2 speakers) is
+    healed when both local speakers map to the same global cluster.
+    """
+    import numpy as np
+    import torch
+    import torchaudio
+    from pyannote.core import Segment
+    from sklearn.cluster import AgglomerativeClustering
+
+    if not hasattr(torchaudio, "AudioMetaData"):
+        torchaudio.AudioMetaData = object
+
+    pipeline = _get_diarizer()
+    embedder = _get_embedder()
+    wav, sr = torchaudio.load(str(wav_path))
+    total = wav.shape[1] / sr
+    chunk = DIARIZATION_CHUNK_SECONDS
+
+    # Per-window hint: pass the user's speaker count through so dialogue windows
+    # split reliably. Over-splitting in monologue windows is healed by stitching.
+    win_kwargs = {
+        k: v
+        for k, v in {
+            "num_speakers": num_speakers,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+        }.items()
+        if v is not None
+    }
+
+    local_turns: list[tuple[float, float, tuple[int, str]]] = []
+    emb_rows: list = []
+    emb_keys: list[tuple[int, str]] = []
+
+    ci = 0
+    start = 0.0
+    while start < total:
+        seg_len = min(chunk, total - start)
+        clip = wav[:, int(start * sr): int((start + seg_len) * sr)]
+        clip_in = {"waveform": clip, "sample_rate": sr}
+        annotation = pipeline(clip_in, **win_kwargs)
+
+        by_spk: dict[str, list[tuple[float, float]]] = {}
+        for segment, _, speaker in annotation.itertracks(yield_label=True):
+            local_turns.append((start + segment.start, start + segment.end, (ci, speaker)))
+            by_spk.setdefault(speaker, []).append((segment.start, segment.end))
+
+        # One embedding per local speaker = its longest segment in this window.
+        for speaker, segs in by_spk.items():
+            segs.sort(key=lambda x: x[1] - x[0], reverse=True)
+            ls, le = segs[0]
+            ls = max(0.0, ls)
+            le = min(seg_len, le)
+            if le - ls < 0.5:
+                continue
+            try:
+                vec = embedder.crop(clip_in, Segment(ls, le))
+                emb_rows.append(np.asarray(vec).reshape(-1))
+                emb_keys.append((ci, speaker))
+            except Exception:
+                log.exception("embedding failed for window %d speaker %s", ci, speaker)
+
+        ci += 1
+        start += chunk
+
+    if not emb_rows:
+        return _clean_turns([Turn(s, e, "SPEAKER_00") for s, e, _ in local_turns])
+
+    # Cluster per-window speakers into global identities by embedding similarity.
+    X = np.vstack(emb_rows)
+    X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    if len(emb_rows) == 1:
+        labels = [0]
+    elif num_speakers is not None:
+        n = min(num_speakers, len(emb_rows))
+        labels = AgglomerativeClustering(
+            n_clusters=n, metric="cosine", linkage="average"
+        ).fit_predict(X)
+    else:
+        labels = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=DIARIZATION_STITCH_THRESHOLD,
+            metric="cosine",
+            linkage="average",
+        ).fit_predict(X)
+
+    keymap = {emb_keys[i]: f"SPEAKER_{int(labels[i]):02d}" for i in range(len(emb_keys))}
+
+    # Remap local turns → global speakers. A local speaker with no embedding
+    # (too short) falls back to the dominant global speaker of its window.
+    win_global_counts: dict[int, dict[str, float]] = {}
+    for s, e, (cidx, spk) in local_turns:
+        g = keymap.get((cidx, spk))
+        if g is not None:
+            win_global_counts.setdefault(cidx, {})[g] = (
+                win_global_counts.setdefault(cidx, {}).get(g, 0.0) + (e - s)
+            )
+
+    global_turns: list[Turn] = []
+    for s, e, (cidx, spk) in local_turns:
+        g = keymap.get((cidx, spk))
+        if g is None:
+            counts = win_global_counts.get(cidx)
+            g = max(counts, key=counts.get) if counts else "SPEAKER_00"
+        global_turns.append(Turn(s, e, g))
+
+    turns = _clean_turns(global_turns)
+    dist: dict[str, float] = {}
+    for t in turns:
+        dist[t.speaker] = dist.get(t.speaker, 0.0) + (t.end - t.start)
+    log.info("Chunked diarization (%d windows): %s",
+             ci, {k: f"{v:.0f}s" for k, v in sorted(dist.items())})
     return turns
 
 
 def _speaker_at(t: float, turns: list[Turn]) -> str:
-    """Return the speaker whose diarization turn contains t. Nearest fallback."""
+    """Return the speaker whose diarization turn contains t.
+
+    Fallback strategy for words that land in a gap between turns:
+    find the turn whose boundary is nearest to t, preferring the START of
+    the next turn over the END of the previous turn — this correctly handles
+    the common case where Whisper places a word's timestamp slightly before
+    pyannote's speaker-change boundary (both tools have ~200ms timing error).
+    """
+    # Pass 1: exact containment
     for turn in turns:
         if turn.start <= t <= turn.end:
             return turn.speaker
+
     if not turns:
         return "SPEAKER_??"
-    return min(turns, key=lambda x: min(abs(x.start - t), abs(x.end - t))).speaker
+
+    # Pass 2: gap fallback — find the prev and next turns bracketing t, then
+    # choose whichever boundary is closer, biased toward the START of the next
+    # turn (not the END of the previous one).
+    prev_turn: Turn | None = None
+    next_turn: Turn | None = None
+    for turn in turns:
+        if turn.end <= t:
+            if prev_turn is None or turn.end > prev_turn.end:
+                prev_turn = turn
+        elif turn.start >= t:
+            if next_turn is None or turn.start < next_turn.start:
+                next_turn = turn
+
+    if prev_turn is None:
+        return next_turn.speaker  # type: ignore[union-attr]
+    if next_turn is None:
+        return prev_turn.speaker
+
+    dist_to_prev_end = t - prev_turn.end      # how long ago prev speaker finished
+    dist_to_next_start = next_turn.start - t  # how soon next speaker starts
+
+    # Prefer the next speaker when it's within 0.6 s and the gap is small
+    # (covers the typical Whisper/pyannote timestamp offset).
+    if next_turn.speaker != prev_turn.speaker and dist_to_next_start <= 0.6:
+        return next_turn.speaker
+
+    return prev_turn.speaker if dist_to_prev_end <= dist_to_next_start else next_turn.speaker
 
 
 # --------------------------------------------------------------------------- #
@@ -573,8 +842,8 @@ def _segment_to_blocks(seg: dict, turns: list[Turn]) -> list[Block]:
             for r in runs
         ]
 
-    # Length mismatch (rare — whisper tokenized differently than whitespace split):
-    # fall back to dominant-speaker for the whole segment with original text.
+    # Length mismatch — whisper tokenized differently than whitespace split.
+    # Fall back to dominant-speaker for the whole segment.
     spk = _dominant_speaker(float(seg["start"]), float(seg["end"]), turns)
     return [Block(spk, float(seg["start"]), float(seg["end"]), text)]
 
@@ -708,16 +977,27 @@ def transcribe_file(
 
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "audio.wav"
+        wav_diar = Path(tmp) / "audio_diar.wav"
         _p("Preparing audio (highpass + normalize)…", 0.05)
+        # Two streams from the same source, same timeline: a normalized one for
+        # ASR, and a lightly-filtered one for diarization (heavy normalization
+        # erases the per-speaker cues pyannote needs and can collapse a call
+        # onto a single speaker).
         to_wav_16k_mono(src, wav)
+        to_wav_16k_mono_for_diarization(src, wav_diar)
 
         _p("Running speaker diarization…", 0.15)
         turns = diarize(
-            wav,
+            wav_diar,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
+        spk_time: dict[str, float] = {}
+        for t in turns:
+            spk_time[t.speaker] = spk_time.get(t.speaker, 0.0) + (t.end - t.start)
+        log.info("Diarization: %d turn(s), distribution: %s",
+                 len(turns), {k: f"{v:.0f}s" for k, v in sorted(spk_time.items())})
 
         _p(f"Loading model and transcribing with {selected_engine} / {model_label}…", 0.55)
         whisper_result = transcribe_segments(

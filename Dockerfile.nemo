@@ -1,0 +1,16 @@
+# Transcriber on the NVIDIA NeMo base — Sortformer v2.1 diarization + per-language
+# ASR router (Parakeet-v3 / Canary-1b-v2 / Qwen3-ASR-1.7B). Deps only; the app code
+# and model cache are bind-mounted at runtime (see run.sh) so edits need no rebuild.
+FROM nvcr.io/nvidia/nemo:26.02
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Web app + Qwen3-ASR local inference wrapper. torch/transformers/nemo come from base.
+RUN pip install --no-cache-dir \
+        fastapi "uvicorn[standard]" python-multipart python-dotenv soundfile qwen-asr
+
+WORKDIR /workspace/transcriber
+EXPOSE 8765
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8765", "--log-level", "info"]

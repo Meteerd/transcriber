@@ -69,6 +69,17 @@
     cursor: pointer; outline: none;
   }
   .opt select:hover, .opt select:focus { border-color: var(--border-strong); }
+  .engine-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--bg-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .engine-badge::before {
+    content: ""; width: 7px; height: 7px; border-radius: 999px;
+    background: var(--good); box-shadow: 0 0 6px var(--good);
+  }
+  .engine-badge .accel { color: var(--muted); font-size: 12px; }
   .opt-hint {
     flex-basis: 100%;
     color: var(--muted-2); font-size: 11px;
@@ -293,16 +304,15 @@
       <h1>Transcriber</h1>
       <span class="tag">local</span>
     </div>
-    <span class="meta">whisper · pyannote · MLX</span>
+    <span class="meta">Sortformer · Parakeet/Qwen ·MLX</span>
   </header>
 
 	  <div class="options">
 	    <div class="opt">
-	      <label for="engine">Engine</label>
-	      <select id="engine">
-	        <option value="mlx">MLX (Apple Silicon)</option>
-	        <option value="faster-whisper">CUDA / CPU</option>
-	      </select>
+	      <label>Engine</label>
+	      <div class="engine-badge" id="engineBadge" title="Engine is fixed by this machine's hardware">
+	        <span class="engine-name">Detecting…</span>
+	      </div>
 	    </div>
 	    <div class="opt">
 	      <label for="language">Language</label>
@@ -310,6 +320,7 @@
 	        <option value="auto">Auto-detect</option>
 	        <option value="en">English</option>
 	        <option value="tr-en">Turkish + English mixed</option>
+	        <option value="tr-hu">Turkish + Hungarian mixed</option>
 	        <option value="tr">Turkish</option>
 	        <option value="hu-en">Hungarian + English mixed</option>
 	        <option value="hu">Hungarian</option>
@@ -324,10 +335,10 @@
 	      </select>
 	    </div>
 	    <div class="opt">
-	      <label for="quality">Quality</label>
-	      <select id="quality">
-	        <option value="turbo">Turbo (fast)</option>
-	        <option value="full">Full v3 (best for TR / HU)</option>
+	      <label>Best model</label>
+	      <div class="engine-badge" id="modelHint" title="Chosen automatically from the language you pick"><span class="engine-name">auto</span></div>
+	      <select id="quality" style="display:none">
+	        <option value="full" selected>full</option>
 	      </select>
 	    </div>
 	    <div class="opt">
@@ -342,7 +353,11 @@
 	        <option value="6">6</option>
 	      </select>
 	    </div>
-	    <div class="opt-hint">Hint: for code-switched VC calls, use Turkish + English mixed, Full v3, and known speaker count.</div>
+	    <div class="opt" style="flex-basis:100%">
+	      <label for="context">Names &amp; terms (helps spelling, esp. Turkish medical / code-switch)</label>
+	      <textarea id="context" rows="2" placeholder="e.g. myocardium, in situ, dexamethasone, anastomosis; names: Janos, Domi, Grayscape" style="width:100%;resize:vertical"></textarea>
+	    </div>
+	    <div class="opt-hint">Pick the language and the best model is selected automatically (Sortformer diarization for all). For Turkish/medical code-switch, paste your Latin/English terms above so they're spelled correctly.</div>
 	  </div>
 
   <label class="drop" for="file" id="drop">
@@ -378,6 +393,33 @@ const jobsView = new Map();   // job_id -> DOM node
 const jobsState = new Map();  // job_id -> latest server state
 const pollFailures = new Map(); // job_id -> consecutive failed polls
 let lastNames = {};           // remembered SPEAKER_NN -> name from previous renames
+
+// Engine is fixed by the machine the server runs on (CUDA box vs Mac). Fetched
+// from /config; the user never picks it. Default keeps uploads working if the
+// fetch is slow.
+const RUNTIME = { engine: "faster-whisper", engine_label: "CUDA", accelerator: "" };
+
+async function loadRuntime() {
+  try {
+    const r = await fetch("/config");
+    if (!r.ok) return;
+    const cfg = await r.json();
+    RUNTIME.engine = cfg.engine || RUNTIME.engine;
+    RUNTIME.engine_label = cfg.engine_label || RUNTIME.engine_label;
+    RUNTIME.accelerator = cfg.accelerator || "";
+  } catch (e) {
+    console.error("config fetch failed", e);
+  }
+  const badge = document.getElementById("engineBadge");
+  if (badge) {
+    const accel = RUNTIME.accelerator && RUNTIME.accelerator !== RUNTIME.engine_label
+      ? ` <span class="accel">· ${RUNTIME.accelerator}</span>` : "";
+    badge.innerHTML = `<span class="engine-name">${RUNTIME.engine_label}</span>${accel}`;
+  }
+  const meta = document.querySelector("header .meta");
+  if (meta) meta.textContent = `Sortformer · Parakeet/Qwen ·${RUNTIME.engine_label}`;
+}
+loadRuntime();
 
 fetch("/last-names").then(r => r.json()).then(d => lastNames = d || {}).catch(() => {});
 
@@ -468,7 +510,7 @@ function render(state) {
 	      fmtDur(state.duration_seconds),
 	      (state.language || "auto"),
 	      (state.engine || "mlx"),
-	      (state.model_quality === "full" ? "full-v3" : "turbo"),
+	      ((MODEL_BY_LANG[state.language_hint] || "auto")),
 	    ];
     parts.forEach(p => {
       const s = document.createElement("span");
@@ -613,7 +655,7 @@ function render(state) {
 	function progressParts(state) {
 	  const parts = [
 	    state.engine || "mlx",
-	    state.model_quality === "full" ? "full-v3" : "turbo",
+	    (MODEL_BY_LANG[state.language_hint] || "auto"),
 	    state.language_hint || state.language || "auto",
 	  ];
 	  if (state.speaker_hint && state.speaker_hint !== "auto") parts.push(`${state.speaker_hint} speakers`);
@@ -631,11 +673,11 @@ function render(state) {
 	    return "Converting the source file to clean 16 kHz mono WAV. Large phone recordings can take a minute or two.";
 	  }
 	  if (step === "diarize") {
-	    return "Detecting speaker turns with pyannote. This is often the slowest local step and can sit here for several minutes.";
+	    return "Detecting speaker turns with Sortformer v2.1. On long meetings this can sit here for a minute or two.";
 	  }
 	  if (step === "transcribe") {
 	    if (state.model_quality === "full") {
-	      return "Running full large-v3 for best quality. First run may download about 3 GB, then transcription starts.";
+	      return "Transcribing with the best model for this language. The first run of a model loads it into GPU memory, then transcription starts.";
 	    }
 	    return "Running Whisper transcription and word timestamps. First use of a model can include a one-time download.";
 	  }
@@ -688,10 +730,11 @@ async function poll(jobId) {
 
 async function upload(file) {
   const tmpId = "tmp-" + Math.random().toString(36).slice(2);
-  const selectedEngine = document.getElementById("engine").value;
+  const selectedEngine = RUNTIME.engine;  // fixed by the machine, not a dropdown
   const selectedLanguage = document.getElementById("language").value;
   const selectedQuality = document.getElementById("quality").value;
   const selectedSpeakers = document.getElementById("speakers").value;
+  const contextText = (document.getElementById("context")?.value || "").trim();
   render({
     id: tmpId,
     original_name: file.name,
@@ -712,6 +755,7 @@ async function upload(file) {
 		  fd.append("language", selectedLanguage);
 		  fd.append("quality", selectedQuality);
 		  fd.append("speakers", selectedSpeakers);
+		  fd.append("context", contextText);
   try {
     const r = await fetch("/transcribe", { method: "POST", body: fd });
     if (!r.ok) throw new Error("upload failed: HTTP " + r.status);
@@ -729,6 +773,22 @@ async function upload(file) {
 function handleFiles(files) {
   for (const f of files) upload(f);
 }
+
+// Show which model the router will use for the chosen language.
+const MODEL_BY_LANG = {
+  "auto": "Qwen3-ASR (broad)", "en": "Parakeet-v3", "de": "Parakeet-v3",
+  "fr": "Parakeet-v3", "es": "Parakeet-v3", "it": "Parakeet-v3",
+  "hu-en": "Parakeet-v3", "hu": "Canary-1b-v2",
+  "tr": "Qwen3-ASR", "tr-en": "Qwen3-ASR", "tr-hu": "Qwen3-ASR",
+  "ru": "Qwen3-ASR", "ar": "Qwen3-ASR", "zh": "Qwen3-ASR", "ja": "Qwen3-ASR",
+};
+function updateModelHint() {
+  const el = document.getElementById("modelHint");
+  const lang = document.getElementById("language").value;
+  if (el) el.querySelector(".engine-name").textContent = MODEL_BY_LANG[lang] || "auto";
+}
+document.getElementById("language").addEventListener("change", updateModelHint);
+updateModelHint();
 
 // File input handlers — label[for=file] handles the click, no JS needed.
 fileInput.addEventListener("change", () => {

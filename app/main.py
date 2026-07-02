@@ -26,8 +26,16 @@ from app.transcribe import (
     MIXED_LANGUAGE_PROMPTS,
     WHISPER_MODEL_TURBO,
     WHISPER_MODEL_FULL,
-    transcribe_file,
 )
+
+# Engine backend. "nemo" = the containerized Sortformer + per-language ASR router
+# (Parakeet / Canary / Qwen3-ASR). Anything else keeps the legacy Whisper+pyannote
+# pipeline. Selected by env so the same codebase runs in both environments.
+_BACKEND = os.environ.get("TRANSCRIBER_BACKEND", "").lower()
+if _BACKEND == "nemo":
+    from app.nemo_pipeline import transcribe_file
+else:
+    from app.transcribe import transcribe_file
 
 ROOT = Path(__file__).resolve().parent.parent
 UPLOADS = ROOT / "uploads"
@@ -43,6 +51,60 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("transcriber")
 
 app = FastAPI(title="Local Transcriber")
+
+
+# --------------------------------------------------------------------------- #
+# Runtime / accelerator detection.
+#
+# The engine is decided by THIS machine's hardware, never by the user. On the
+# CUDA box it locks to faster-whisper/CUDA; on a Mac it locks to mlx/Apple
+# Silicon. The UI shows the locked engine as a read-only badge — there is no
+# engine dropdown. The user only configures language / quality / speakers.
+# --------------------------------------------------------------------------- #
+_runtime_cache: dict[str, str] | None = None
+
+
+def detect_runtime() -> dict[str, str]:
+    """Return the engine + human labels for the hardware this server runs on.
+
+    Cached after first call. Detection order: CUDA GPU → Apple Silicon (MPS) →
+    CPU fallback (honoring an explicit WHISPER_ENGINE env if set).
+    """
+    global _runtime_cache
+    if _runtime_cache is not None:
+        return _runtime_cache
+
+    engine = (os.environ.get("WHISPER_ENGINE") or "faster-whisper").lower()
+    engine_label = "CPU"
+    accelerator = "CPU"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            engine = "faster-whisper"
+            engine_label = "CUDA"
+            try:
+                accelerator = torch.cuda.get_device_name(0)
+            except Exception:
+                accelerator = "CUDA GPU"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            engine = "mlx"
+            engine_label = "Apple Silicon"
+            accelerator = "MLX"
+        else:
+            engine_label = "Apple Silicon" if engine == "mlx" else "CPU"
+            accelerator = "MLX" if engine == "mlx" else "CPU"
+    except Exception:
+        engine_label = "Apple Silicon" if engine == "mlx" else "CPU"
+        accelerator = "Apple Silicon (MLX)" if engine == "mlx" else "CPU"
+
+    _runtime_cache = {
+        "engine": engine,
+        "engine_label": engine_label,
+        "accelerator": accelerator,
+    }
+    log.info("Runtime engine locked to %s (%s / %s)", engine, engine_label, accelerator)
+    return _runtime_cache
 
 
 @app.middleware("http")
@@ -107,6 +169,7 @@ def _run_job(
     initial_prompt: str | None = None,
     model: str | None = None,
     num_speakers: int | None = None,
+    context: str | None = None,
 ) -> None:
     def progress(stage: str, frac: float | None) -> None:
         _update_job(
@@ -125,6 +188,7 @@ def _run_job(
             started_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat(),
         )
+        extra = {"context": context} if _BACKEND == "nemo" else {}
         out_path, result = transcribe_file(
             upload_path,
             output_dir=TRANSCRIPTS,
@@ -135,6 +199,7 @@ def _run_job(
             initial_prompt=initial_prompt,
             model=model,
             num_speakers=num_speakers,
+            **extra,
         )
         _update_job(
             job_id,
@@ -177,6 +242,27 @@ async def index() -> HTMLResponse:
     return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"))
 
 
+@app.get("/config")
+async def runtime_config() -> JSONResponse:
+    """Tell the UI which engine this machine is locked to, for the badge."""
+    rt = detect_runtime()
+    if _BACKEND == "nemo":
+        return JSONResponse(
+            {
+                "engine": "nemo",
+                "engine_label": "NeMo",
+                "accelerator": f"Sortformer + Parakeet/Qwen · {rt['accelerator']}",
+            }
+        )
+    return JSONResponse(
+        {
+            "engine": rt["engine"],
+            "engine_label": rt["engine_label"],
+            "accelerator": rt["accelerator"],
+        }
+    )
+
+
 _VALID_QUALITY = {"turbo", "full"}
 _VALID_ENGINES = {"mlx", "faster-whisper"}
 _VALID_LANGS = {
@@ -186,6 +272,7 @@ _VALID_LANGS = {
     "en",
     "tr",
     "tr-en",
+    "tr-hu",
     "hu",
     "hu-en",
     "de",
@@ -240,15 +327,18 @@ def _copy_upload_with_limit(file: UploadFile, upload_path: Path) -> None:
 @app.post("/transcribe")
 async def transcribe_endpoint(
     file: UploadFile = File(...),
-    engine: str = Form("mlx"),
+    engine: str = Form("auto"),  # accepted for backward compat, but ignored
     language: str = Form("auto"),
-    quality: str = Form("turbo"),
+    quality: str = Form("turbo"),  # legacy; NeMo backend picks the model by language
     speakers: str = Form("auto"),
+    context: str = Form(""),  # glossary of names/terms for code-switch biasing (NeMo)
 ) -> JSONResponse:
     if not file.filename:
         raise HTTPException(400, "No filename")
-    if engine not in _VALID_ENGINES:
-        raise HTTPException(400, f"engine must be one of {_VALID_ENGINES}")
+    # The engine is fixed by this machine's hardware, not the client. Whatever
+    # the form sends is ignored — the CUDA box always runs faster-whisper/CUDA,
+    # a Mac always runs mlx.
+    engine = detect_runtime()["engine"]
     if quality not in _VALID_QUALITY:
         raise HTTPException(400, f"quality must be one of {_VALID_QUALITY}")
     if language not in _VALID_LANGS:
@@ -257,6 +347,9 @@ async def transcribe_endpoint(
     lang, initial_prompt, language_hint = _language_settings(language)
     model = _model_for(engine, quality)
     num_speakers = _parse_speakers(speakers)
+    # The NeMo router keys on the full language code (incl. mixed variants like
+    # "tr-en"/"tr-hu"); the legacy pipeline uses the resolved single-lang hint.
+    job_language = language_hint if _BACKEND == "nemo" else lang
 
     job_id = uuid.uuid4().hex
     safe_name = Path(file.filename).name  # strip any path
@@ -284,10 +377,11 @@ async def transcribe_endpoint(
         args=(job_id, upload_path, safe_name),
         kwargs={
             "engine": engine,
-            "language": lang,
+            "language": job_language,
             "initial_prompt": initial_prompt,
             "model": model,
             "num_speakers": num_speakers,
+            "context": context,
         },
         daemon=True,
     ).start()
