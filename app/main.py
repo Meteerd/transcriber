@@ -10,6 +10,7 @@ import subprocess
 import threading
 import uuid
 from datetime import datetime
+from urllib.parse import unquote
 from pathlib import Path
 from typing import Any
 
@@ -412,7 +413,10 @@ async def list_jobs() -> JSONResponse:
 
 @app.get("/transcripts/{name}")
 async def download_transcript(name: str) -> FileResponse:
-    path = TRANSCRIPTS / Path(name).name
+    # Newer Starlette does not percent-decode the path param, so decode it here
+    # (idempotent for already-decoded names). Without this, any transcript whose
+    # filename contains a space/parenthesis 404s.
+    path = TRANSCRIPTS / Path(unquote(name)).name
     if not path.exists():
         raise HTTPException(404, "Not found")
     return FileResponse(path, media_type="text/markdown", filename=path.name)
