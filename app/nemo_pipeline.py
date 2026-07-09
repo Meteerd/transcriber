@@ -23,7 +23,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from app.transcribe import Block, TranscriptionResult, to_markdown
+from app.transcribe import (
+    Block,
+    TranscriptionResult,
+    _split_text_preserving_punctuation,
+    to_markdown,
+)
 
 log = logging.getLogger("transcriber.nemo")
 ProgressCb = Callable[[str, "float | None"], None]
@@ -285,15 +290,44 @@ def _asr_parakeet_wordts(wav: Path, turns: list[Turn], force_lang: str | None) -
 # Qwen's LLM decoder is heavier per-token than Parakeet's transducer, so use a
 # shorter window (keeps max_new_tokens comfortably ahead of real speech length).
 _QWEN_WINDOW_S = float(os.environ.get("QWEN_WINDOW_S", "150"))
+# How far from the target boundary we'll search for a natural pause to cut on.
+_QWEN_BOUNDARY_SEARCH_S = float(os.environ.get("QWEN_BOUNDARY_SEARCH_S", "20"))
+
+
+def _next_window_boundary(turns: list[Turn], after: float, target_len: float) -> float:
+    """Cutting audio windows mid-sentence produces a cold-start garble right
+    after the cut (no context for the model to warm up on). Snap the boundary
+    to the nearest silence gap between diarization turns near the target, so
+    windows break on actual pauses instead of an arbitrary fixed second."""
+    target = after + target_len
+    best, best_dist = None, _QWEN_BOUNDARY_SEARCH_S
+    for i in range(len(turns) - 1):
+        gap_start, gap_end = turns[i].end, turns[i + 1].start
+        if gap_end <= after or gap_start < after:
+            continue
+        mid = (gap_start + gap_end) / 2
+        if abs(mid - target) < best_dist:
+            best, best_dist = mid, abs(mid - target)
+    return best if best is not None else target
 
 
 def _qwen_words(res, offset: float) -> list[dict]:
+    """Pair the forced-aligner's per-word timings with the model's own punctuated
+    text (res.text) so blocks read as sentences, not a run-on wall of words —
+    the aligner's item.text is bare (no commas/periods), but it's one item per
+    text token, so zipping by index recovers punctuation when counts line up."""
     ts = getattr(res, "time_stamps", None)
     items = getattr(ts, "items", None) if ts else None
     if not items:
         return []
-    return [{"word": it.text, "start": float(it.start_time) + offset,
-             "end": float(it.end_time) + offset} for it in items]
+    punct_tokens = _split_text_preserving_punctuation(getattr(res, "text", "") or "")
+    use_punct = len(punct_tokens) == len(items)
+    out = []
+    for i, it in enumerate(items):
+        word = punct_tokens[i] if use_punct else it.text
+        out.append({"word": word, "start": float(it.start_time) + offset,
+                    "end": float(it.end_time) + offset})
+    return out
 
 
 def _asr_qwen_wordts(wav: Path, turns: list[Turn], force_lang: str | None,
@@ -314,14 +348,16 @@ def _asr_qwen_wordts(wav: Path, turns: list[Turn], force_lang: str | None,
         import soundfile as sf
         start = 0.0
         while start < dur:
+            end = _next_window_boundary(turns, start, _QWEN_WINDOW_S) if start + _QWEN_WINDOW_S < dur else dur
+            end = min(end, dur)
             a = int(start * sr)
-            b = min(len(data), int((start + _QWEN_WINDOW_S) * sr))
+            b = min(len(data), int(end * sr))
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
                 sf.write(tf.name, data[a:b], sr)
                 res = qwen.transcribe(audio=tf.name, language=force_lang,
                                       context=context or "", return_time_stamps=True)
                 words += _qwen_words(res[0], start)
-            start += _QWEN_WINDOW_S
+            start = end
     if not words:
         spk = turns[0].speaker if turns else "SPEAKER_00"
         end = turns[-1].end if turns else 0.0
