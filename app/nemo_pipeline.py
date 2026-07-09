@@ -32,6 +32,7 @@ SORTFORMER_MODEL = os.environ.get("SORTFORMER_MODEL", "nvidia/diar_streaming_sor
 PARAKEET_MODEL = os.environ.get("PARAKEET_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
 CANARY_MODEL = os.environ.get("CANARY_MODEL", "nvidia/canary-1b-v2")
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B")
+QWEN_ALIGNER_MODEL = os.environ.get("QWEN_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 
 # A persistent default glossary for code-switched medical speech; the UI can add
 # to it per-upload. Passed as Qwen3-ASR `context=` to preserve exact term spelling.
@@ -44,11 +45,15 @@ _ROUTER: dict[str, tuple[str, str, str | None]] = {
     "en":    ("wordts",  "parakeet", "en"),
     "hu":    ("chunked", "canary",   "hu"),
     "hu-en": ("wordts",  "parakeet", None),
-    "tr":    ("chunked", "qwen",     "Turkish"),
-    # Force the dominant language so Qwen can't misdetect short turns into a
-    # random language; its LLM decoder + glossary still keep embedded EN/Latin.
-    "tr-en": ("chunked", "qwen",     "Turkish"),
-    "tr-hu": ("chunked", "qwen",     "Turkish"),
+    # "wordts" for Qwen too: transcribe long continuous windows (full context)
+    # then split by speaker via forced-aligner word timestamps — per-turn
+    # chunked calls starved Qwen of context and it hallucinated fluent-sounding
+    # but invented sentences on short/weak-signal turns. Force the dominant
+    # language so it can't misdetect short spans into a random language; the
+    # LLM decoder + glossary still keep embedded EN/Latin terms intact.
+    "tr":    ("wordts", "qwen", "Turkish"),
+    "tr-en": ("wordts", "qwen", "Turkish"),
+    "tr-hu": ("wordts", "qwen", "Turkish"),
     "de":    ("wordts",  "parakeet", "de"),
     "fr":    ("wordts",  "parakeet", "fr"),
     "es":    ("wordts",  "parakeet", "es"),
@@ -123,9 +128,10 @@ def _get_qwen():
         from qwen_asr import Qwen3ASRModel
         torch = _torch()
         _models["qwen"] = Qwen3ASRModel.from_pretrained(
-            QWEN_MODEL, dtype=torch.bfloat16, device_map="cuda:0", max_new_tokens=440,
+            QWEN_MODEL, dtype=torch.bfloat16, device_map="cuda:0", max_new_tokens=800,
+            forced_aligner=QWEN_ALIGNER_MODEL,
         )
-        log.info("Loaded ASR %s", QWEN_MODEL)
+        log.info("Loaded ASR %s + aligner %s", QWEN_MODEL, QWEN_ALIGNER_MODEL)
     return _models["qwen"]
 
 
@@ -276,6 +282,53 @@ def _asr_parakeet_wordts(wav: Path, turns: list[Turn], force_lang: str | None) -
     return _blocks_from_wordts(words, turns)
 
 
+# Qwen's LLM decoder is heavier per-token than Parakeet's transducer, so use a
+# shorter window (keeps max_new_tokens comfortably ahead of real speech length).
+_QWEN_WINDOW_S = float(os.environ.get("QWEN_WINDOW_S", "150"))
+
+
+def _qwen_words(res, offset: float) -> list[dict]:
+    ts = getattr(res, "time_stamps", None)
+    items = getattr(ts, "items", None) if ts else None
+    if not items:
+        return []
+    return [{"word": it.text, "start": float(it.start_time) + offset,
+             "end": float(it.end_time) + offset} for it in items]
+
+
+def _asr_qwen_wordts(wav: Path, turns: list[Turn], force_lang: str | None,
+                     context: str) -> list[Block]:
+    """Transcribe long continuous windows (full conversational context) with
+    Qwen3-ASR's forced aligner, then split by speaker via word timestamps —
+    same robust shape as the Parakeet path, instead of isolated per-turn calls
+    that starve the LLM decoder of context and invite hallucination."""
+    qwen = _get_qwen()
+    data, sr = _load_audio(wav)
+    dur = len(data) / sr if sr else 0.0
+    words: list[dict] = []
+    if dur <= _QWEN_WINDOW_S:
+        res = qwen.transcribe(audio=str(wav), language=force_lang,
+                              context=context or "", return_time_stamps=True)
+        words = _qwen_words(res[0], 0.0)
+    else:
+        import soundfile as sf
+        start = 0.0
+        while start < dur:
+            a = int(start * sr)
+            b = min(len(data), int((start + _QWEN_WINDOW_S) * sr))
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
+                sf.write(tf.name, data[a:b], sr)
+                res = qwen.transcribe(audio=tf.name, language=force_lang,
+                                      context=context or "", return_time_stamps=True)
+                words += _qwen_words(res[0], start)
+            start += _QWEN_WINDOW_S
+    if not words:
+        spk = turns[0].speaker if turns else "SPEAKER_00"
+        end = turns[-1].end if turns else 0.0
+        return [Block(spk, 0.0, end, "")]
+    return _blocks_from_wordts(words, turns)
+
+
 def _load_audio(wav: Path):
     import soundfile as sf
     data, sr = sf.read(str(wav), dtype="float32")
@@ -374,7 +427,9 @@ def transcribe_file(
                  {k: f"{v:.0f}s" for k, v in sorted(dist.items())})
 
         _p(f"Transcribing with {label.rsplit('/', 1)[-1]}…", 0.5)
-        if strategy == "wordts":
+        if strategy == "wordts" and model_key == "qwen":
+            blocks = _asr_qwen_wordts(wav, turns, force_lang, ctx)
+        elif strategy == "wordts":
             blocks = _asr_parakeet_wordts(wav, turns, force_lang)
         else:
             blocks = _asr_chunked(wav, turns, model_key, force_lang, ctx)
